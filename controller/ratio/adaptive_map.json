@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "source": "adaptive_map",
+  "basis": "Exp_15/16/17 실측 (A6000, opt-6.7b fp16 S=1024·bert-large·resnet50, MPS opt-in, 15s 창) — 일반화 계수 아님",
+  "phase_labels": ["PREFILL", "DECODE", "DECODE_BATCHED", "MIXED", "IDLE"],
+  "pairs": {
+    "PREFILL+DECODE": {
+      "oc_eff": {"50/50": 1.205, "70/30": 1.222, "30/70": 1.001},
+      "recommend": {"sm_split": "70/30 (compute 우대)", "note": "50/50 대비 +1.7%p — compute 우대 + decode 최소 보장이면 충분"},
+      "time_control": "성립 (Exp_16/18: 오차 ≤0.007, SM 과 직교)",
+      "exp": "Exp_15 §2-3, Exp_16"
+    },
+    "PREFILL+PREFILL": {
+      "oc_eff": {"50/50": 0.945},
+      "recommend": {"sm_split": null, "note": "co-location 회피 (순차보다 나쁨)"},
+      "exp": "Exp_15 §2"
+    },
+    "DECODE+DECODE": {
+      "oc_eff": {"50/50": 1.152},
+      "recommend": {"sm_split": "50/50", "note": "허용 — 단 대역폭 간섭(간섭계수 0.59), 이종 후보 있으면 교체"},
+      "exp": "Exp_15 §2"
+    },
+    "PREFILL+DECODE_BATCHED": {
+      "oc_eff": {"50/50(b4)": 0.946, "70/30(b4)": 1.033, "50/50(b8)": 1.141, "70/30(b8)": 1.139},
+      "recommend": {"sm_split": "b4: 회피 또는 70/30, b8: 50/50", "note": "배치 반전으로 C×C 화 — 정적 계수 이월 금지, 재분류 필수 (Exp_17 §3)"},
+      "exp": "Exp_17 §3"
+    },
+    "PREFILL+DECODE+DECODE": {
+      "oc_eff": {"33/33/33": 1.135},
+      "recommend": {"sm_split": "33/33/33", "note": "time 3-way 성립(2:1:1 오차 ≤0.006), SM 3분할 직교"},
+      "exp": "Exp_17 §4"
+    },
+    "COMPUTE_BOUND+DECODE": {
+      "oc_eff": {"50/50 (bert-large×decode)": 1.212},
+      "recommend": {"sm_split": "compute 우대", "note": "모델 축 재현 — C×M 일반 케이스"},
+      "exp": "Exp_17 §2"
+    },
+    "COMPUTE_BOUND+MEMORY_BOUND_SM_HEAVY": {
+      "oc_eff": {"50/50 (bert×rtrain)": 1.089},
+      "recommend": {"sm_split": "50/50", "note": "M 측이 SM 점유형(CNN)이면 이득 절반 이하 — 페어링 점수에 SM occupancy 필요"},
+      "exp": "Exp_17 §2"
+    },
+    "MEMORY_BOUND+MEMORY_BOUND": {
+      "oc_eff": {"50/50 (rtrain×decode)": 1.147, "50/50 (rtrain×rtrain)": 1.083},
+      "recommend": {"sm_split": "50/50", "note": "동종-M 수준"},
+      "exp": "Exp_17 §2"
+    }
+  },
+  "phase_transition_actions": {
+    "PREFILL->DECODE": "파트너가 DECODE 면 70/30 유지 근거 소멸 → 50/50 복귀 (Exp_17 §5: 70/30 고정 시 파트너 잔존 0.385)",
+    "DECODE->DECODE_BATCHED": "C 반전 — 페어 재평가 (PREFILL 파트너면 b4 기준 회피/70/30)",
+    "any->terminating": "Turnaround Booster 트리거 (자원 선회수, Exp_14 신호 스키마)"
+  }
+}
