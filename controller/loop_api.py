@@ -9,6 +9,7 @@ transition→ratios 매핑; adaptive_map lookup 은 감사 기록용으로 첨�
   GET  /feeder/occupancy         time_stats 샘플 → 직전 대비 실측 점유
   POST /feeder/register          {tenant, sock, log, time_ratio}
   POST /feeder/arm|release       {tenant}
+  POST /feeder/deregister        {tenant}           [Exp_53] watcher 자동 정리
   POST /feeder/ratios            {ratios:{...}, reason}
   POST /feeder/env_policy        {policy, reason}   [Exp_40] strict|relaxed_hetero|capped_hetero
   GET  /lifecycle/state          상태머신 현재 상태 + 감사 로그
@@ -107,6 +108,9 @@ def handle_post(h, path, body):
             h._send_json({"ok": True})
         elif path == "/feeder/release":
             _feeder.release(body["tenant"])
+            h._send_json({"ok": True})
+        elif path == "/feeder/deregister":         # [Exp_53] 생명주기 자동화
+            _feeder.deregister(body["tenant"])
             h._send_json({"ok": True})
         elif path == "/feeder/ratios":
             _feeder.set_ratios(body["ratios"], reason=body.get("reason", ""))

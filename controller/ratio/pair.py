@@ -27,6 +27,7 @@ prefill×decode 1조합 (Exp_39b). 3+ tenant 는 정의하지 않고 strict 폴�
 
 from .engine import (CLASS_COMPUTE, CLASS_MEMORY, EPS, bless_limit_pct,
                      decide)
+from .pair_predict import predict_pair
 
 POLICIES = ("strict", "relaxed_hetero", "capped_hetero")
 
@@ -44,23 +45,31 @@ def _strict_member(req):
             "rule_applied": d["rule_applied"]}
 
 
-def decide_pair(requests, policy="strict", mps_running=False):
+def decide_pair(requests, policy="strict", mps_running=False, self_pair_oc=None):
     """2-tenant 페어의 (s, t, gate) 일괄 결정.
 
     입력:
-      requests    [{name, r, workload_class, confidence?}, ...]
+      requests    [{name, r, workload_class, confidence?, device_fill?}, ...]
                   r = 계약 몫 (Σr ≤ 1 — 완전/부분 배분)
+                  device_fill = 분류 v2 공간 지표 (선택 — Exp_48/49 페어링 예측용)
       policy      POLICIES 중 하나 (기본 strict = 기존 동작)
       mps_running 노드 MPS 데몬 상태 (capped_hetero 전제조건, O-3)
+      self_pair_oc M측 자기페어 실측 OC (선택 — 공간 경합 앵커, pair_predict 참조)
 
     반환 dict:
       feasible, applied_policy(실제 적용된 정책), requested_policy,
       fallback_reason(폴백 시), warnings[], members{name: {space_ratio,
-      time_ratio, limit_pct, gate, rule_applied}}
+      time_ratio, limit_pct, gate, rule_applied}},
+      pairing_prediction — ★보조 출력(Exp_49): 예상 조합 특성·OC 앵커·근거.
+        본 함수의 s/t/gate 결정에 일절 관여하지 않는다 (Exp_39b 결론 보호 —
+        이득 원천은 봉투 완화이며 예측은 배치·정책 선택의 입력일 뿐).
+        지표 부재 시 available=False (v1 단독 동작 = 기존 무변경).
     """
     out = {"feasible": False, "requested_policy": policy,
            "applied_policy": None, "fallback_reason": None,
-           "warnings": [], "members": {}}
+           "warnings": [], "members": {},
+           "pairing_prediction": predict_pair(requests,
+                                              self_pair_oc=self_pair_oc)}
     if policy not in POLICIES:
         out["fallback_reason"] = f"알 수 없는 정책 {policy!r} — {POLICIES} 중 하나"
         return out
