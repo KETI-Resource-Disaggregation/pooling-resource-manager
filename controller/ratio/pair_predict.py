@@ -26,10 +26,13 @@
   임계 도출: 이상치 convnext_tiny 를 제외하면 상보군 최대 0.398(decode)와
     경합군 최소 0.415(resnet50 학습) 사이가 비어 있고, 그 **중간점 ≈0.41** 을
     채택. 실측 극값 사이에서만 잡았고 케이스 맞춤 조정은 없다.
-  ★남은 오판 1건(convnext_tiny, wall_fill 0.366인데 실측 경합): 원인 미규명.
-    가설 = 곱 지표가 못 담는 차원(메모리 대역폭 경합 — LayerNorm/depthwise 비중이
-    큰 구조라 cm_ratio 0.49 로 MIXED 경계). Exp_48 의 "축 선택엔 산술 강도 필요"
-    와 같은 방향. 검증 전까지 **가설로만** 기록한다.
+  ★convnext_tiny 오판 — Exp_58 에서 원인 규명·해소: 오판의 근원은 파트너 간섭이
+    아니라 **자기 유지율**(SM 절반에서 혼자서도 ret50 0.716 — 같은 wall_fill 대의
+    densenet121 은 1.003). MEMORY 상반(fill≈1.0)과 COMPUTE 하반(fill≈0.17)의
+    이중구조가 평균 fill 을 희석해 wall_fill 이 이 손실을 못 본다. convnext_small/
+    base 페어 실측(1.085/1.079)으로 계열 전체 경합 확인 → CM_MIXED 보수 가드로
+    반영(아래 상수 주석). 대역폭 가설은 부분 근거만(convnext×decode 상호 간섭
+    0.476 최대) — CUPTI Metrics 고비용 경로는 불채택(가드로 실용 해소).
 
 앵커 (Exp_15/17 실측 — ★카테고리 대표값일 뿐 수치 이전성은 조합 의존):
   이종 상보 1.205 는 하한 성격 — 신규 조합 실측 1.462~1.591 로 상회 가능
@@ -47,6 +50,18 @@ ANCHOR_CONTENDED_FLOOR = 0.945   # 공간 경합 보수 하한 (실측 1.059~1.0
 
 # 임계 (Exp_56 실측 — 근거는 모듈 docstring). 9케이스 중 오판 1건.
 WALL_FILL_HI = 0.41              # 경합 판정: fill × density (벽시계 SM 점유율)
+# MIXED 경계 보수 가드 (Exp_58): cm_ratio 가 이 창에 있으면서 wall_fill 이
+# 임계 미만이면 경합으로 보수 취급. 근거 실측 3건 — convnext_tiny/small/base
+# (cm 0.491/0.542/0.597, wall_fill 0.366/0.341/0.320 전부 임계 미만인데 실측 OC
+# 1.082/1.085/1.079 전부 경합). 기전: MEMORY 상반(LayerNorm/GELU, fill≈1.0)과
+# COMPUTE 하반(smem 무거운 GEMM, fill≈0.17)의 이중구조가 평균 fill 을 희석해
+# wall_fill 이 자기 유지율 손실(ret50 0.716~0.726)을 담지 못한다 (Exp_58 §1).
+# 창 도출: 하단 0.45 = 상보-정답 최대 cm(mobilenet 0.414)과 오판 최소
+# cm(convnext_tiny 0.491)의 중간점. 상단 0.66 = 오판 최대 cm(convnext_base
+# 0.597)과 그 위 최근접 케이스(decode b=2, 0.727)의 중간점 — 단 상단 이웃은
+# 페어 미실측이라 잠정. 정답 케이스 12건 중 창 안은 0건 → 기존 판정 무영향.
+CM_MIXED_LO = 0.45
+CM_MIXED_HI = 0.66
 # 하위호환 참고값 (Exp_49 2D AND — 개정 전 규칙, 문서/테스트 대조용)
 FILL_HI = 0.60
 DENSITY_MIN = 0.5
@@ -112,6 +127,28 @@ def predict_pair(requests, self_pair_oc=None):
 
     wall_fill = fill * density
     contended = wall_fill >= WALL_FILL_HI
+
+    # MIXED 경계 보수 가드 (Exp_58) — cm_ratio 는 선택 입력(부재 시 기존 동작).
+    if not contended:
+        cm = mem.get("cm_ratio")
+        if cm is not None:
+            try:
+                cm = float(cm)
+            except (TypeError, ValueError):
+                cm = None
+        if cm is not None and CM_MIXED_LO <= cm <= CM_MIXED_HI:
+            anchor = (float(self_pair_oc) if self_pair_oc is not None
+                      else ANCHOR_CONTENDED_FLOOR)
+            out.update(
+                available=True, category="hetero_space_contended",
+                expected_oc=anchor,
+                basis=f"이종 + M측 wall_fill {wall_fill:.3f} < {WALL_FILL_HI} "
+                      f"이나 cm_ratio {cm:.3f} ∈ [{CM_MIXED_LO}, {CM_MIXED_HI}] "
+                      f"MIXED 경계 — 보수 경합 취급 (Exp_58: convnext 계열 3건 "
+                      f"실측 전부 경합 1.079~1.085, 이중구조가 wall_fill 을 "
+                      f"희석){density_note}")
+            return out
+
     if contended:
         anchor = (float(self_pair_oc) if self_pair_oc is not None
                   else ANCHOR_CONTENDED_FLOOR)

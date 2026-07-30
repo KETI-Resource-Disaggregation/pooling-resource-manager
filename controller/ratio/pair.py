@@ -21,8 +21,14 @@ OC 1.089 (+0.367 = 이득의 사실상 전부, C−U). 공간 절단은 성능 �
   · confidence 가 HIGH 가 아닌 테넌트가 있으면 → strict (Exp_37 오분류 회피)
   · capped_hetero 인데 mps_running 이 아니면 → relaxed_hetero 로 폴백 (O-3)
 
-일반화 경계 (Exp_40 §제약): 2-tenant 이종 페어 한정 v1. 실측 검증은
-prefill×decode 1조합 (Exp_39b). 3+ tenant 는 정의하지 않고 strict 폴백.
+일반화 경계 (Exp_40 §제약 → Exp_58 §3 개정): relaxed_hetero 는 **N-tenant 이종
+혼합**(C≥1 AND M≥1, 전원 {COMPUTE, MEMORY}, 전원 HIGH)으로 확장 — 공격자/피해자
+판정은 클래스 기반 멤버별(모든 COMPUTE=게이트 t=r, 모든 MEMORY=해제)이며 3자
+실측 2조합에서 성립: C2+M1(prefill+bert+decode) OC 0.503→1.021(+103%, 피해자
+decode 0.211→0.766, charged 는 두 공격자만 0.53/0.47), C1+M2(prefill+decode+
+densenet121) OC 0.540→1.325(+145%, 두 피해자 동시 해방 0.206→0.645/0.192→0.564).
+capped_hetero 는 3+ 미실측 — 3+ 요청 시 relaxed_hetero 로 폴백(사유 기록).
+MIXED/UNCERTAIN 포함·동종은 종전대로 strict.
 """
 
 from .engine import (CLASS_COMPUTE, CLASS_MEMORY, EPS, bless_limit_pct,
@@ -85,15 +91,19 @@ def decide_pair(requests, policy="strict", mps_running=False, self_pair_oc=None)
     if policy != "strict":
         classes = sorted(q["workload_class"] for q in requests)
         confs = [q.get("confidence", "HIGH") for q in requests]
-        if len(requests) != 2:
-            applied, reason = "strict", (f"{len(requests)}-tenant — "
-                                         f"완화 규약은 2-tenant 한정 (v1)")
-        elif classes != sorted([CLASS_COMPUTE, CLASS_MEMORY]):
-            applied, reason = "strict", (f"이종 페어 아님 (classes={classes})"
-                                         " — 동종/UNCERTAIN 은 strict")
+        hetero_mix = (set(classes) == {CLASS_COMPUTE, CLASS_MEMORY})
+        if len(requests) < 2 or not hetero_mix:
+            applied, reason = "strict", (f"이종 혼합 아님 (classes={classes})"
+                                         " — C≥1+M≥1 필요, 동종/UNCERTAIN/MIXED"
+                                         " 은 strict")
         elif any(c != "HIGH" for c in confs):
             applied, reason = "strict", (f"분류 신뢰도 부족 (conf={confs})"
                                          " — Exp_37 오분류 회피 가드")
+        elif policy == "capped_hetero" and len(requests) > 2:
+            applied = "relaxed_hetero"
+            reason = (f"{len(requests)}-tenant capped 은 미실측 — "
+                      "relaxed_hetero 로 폴백 (Exp_58: 3+ 실측은 relaxed 만)")
+            out["warnings"].append("capped_hetero 3+ 미지원 — 공간 상한 미적용")
         elif policy == "capped_hetero" and not mps_running:
             applied = "relaxed_hetero"
             reason = ("MPS 미기동 — s 상한은 무음 no-op 이 되므로 (O-3) "
