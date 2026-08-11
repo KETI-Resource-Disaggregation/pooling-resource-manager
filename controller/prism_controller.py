@@ -89,6 +89,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"tenants": _registry.list_tenants()})
         elif self.path == "/stats":
             self._send_json({"stats": _scheduler.get_stats()})
+        elif self.path.split("?")[0].rstrip("/") == "/capacity":
+            # [Exp_82] A-2 규격: 가용 용량 조회. shim(:8091) 흡수 — 팟 내 catalog(factor)
+            # + physical(shm) + feeder(slices) 조합. K8s allocatable 대신 factor로 광고 산출.
+            self._send_json(_capacity_response())
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -175,6 +179,53 @@ class Handler(BaseHTTPRequestHandler):
 
         else:
             self._send_json({"error": "not found"}, 404)
+
+
+# ── [Exp_82] A-2 가용 용량 (shim :8091 흡수) ─────────────────────────────────
+_CATALOG_PATH = os.environ.get("PRISM_CATALOG", "/etc/prism/catalog.json")
+
+
+def _capacity_response():
+    """A-2 규격 응답. 팟 내 catalog(factor·physical_lsu) + shm + feeder(slices) 조합."""
+    phys_lsu, factor, measured = 178, 1.0, True
+    try:
+        cat = json.load(open(_CATALOG_PATH))
+        factor = float(cat.get("overcommit_factor", 1.0))
+        devs = [d for d in cat.get("devices", {}).values() if d.get("measured")]
+        if devs:
+            phys_lsu = max(d["lsu"] for d in devs)
+    except Exception:
+        pass                         # catalog 미접근 → 보수 기본(178/1.0)
+    adv_lsu = round(phys_lsu * factor)
+    try:
+        tenants = loop_api._feeder.status().get("tenants", {})
+    except Exception:
+        tenants = {}
+    allocated = sum(round(v.get("ratio", 0) * phys_lsu) for v in tenants.values())
+    ratio = round(allocated / phys_lsu, 3) if phys_lsu else 0.0
+    slices = [{"tenant": k, "compute_pct": round(v.get("ratio", 0) * 100, 1),
+               "time_ratio": round(v.get("ratio", 0), 3), "armed": v.get("armed", False)}
+              for k, v in tenants.items()]
+    shm = _shm
+    return {
+        "schema_version": "1.0", "node": os.environ.get("PRISM_NODE", "gpu-npu-server-02"),
+        "devices": [{
+            "uuid": _group_id, "kind": "gpu",
+            "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+            "capacity": {"physical_lsu": phys_lsu, "advertised_lsu": adv_lsu,
+                         "overcommit_factor": factor, "allocated_lsu": allocated,
+                         "allocation_ratio": ratio, "lsu_measured": measured},
+            "memory": {"capacity_mb": getattr(shm, "physical_mem_mb", 97887),
+                       "quota_divisor": "advertised_lsu"},
+            "slices": slices,
+            "interference_hint": {"current_sigma_pct": ratio, "no_interference_below": 1.00,
+                                  "interference_above": 1.40,
+                                  "note": "100~140%는 victim 무게 의존 전이(Exp_80). 경량 저지연 victim ~130%까지 안전"},
+        }],
+        "npu": {"available_cores": 8,
+                "request_rule": {"allowed_blocks": [1, 2, 4, 8], "alignment": "power_of_two_contiguous"},
+                "lsu_measured": False},
+    }
 
 
 # ── 백그라운드 루프 ───────────────────────────────────────────────────────────
