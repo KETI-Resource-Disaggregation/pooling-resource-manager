@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# prism_controller.py
-# PRISM 컨트롤러 메인 진입점
+# kraken_controller.py
+# KRAKEN 컨트롤러 메인 진입점
 #
 # 역할:
 #   1. SHM 생성 및 GPU 정보 초기화
@@ -20,7 +20,7 @@
 #   POST /profiling/exit  {}
 #
 # 실행:
-#   python3 prism_controller.py --group default --port 8090
+#   python3 kraken_controller.py --group default --port 8090
 
 import argparse
 import json
@@ -32,7 +32,7 @@ import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shm'))
-from prism_shm import create_shm, get_gpu_info, MAX_TENANTS
+from kraken_shm import create_shm, get_gpu_info, MAX_TENANTS
 
 from registry   import Registry
 from allocator  import Allocator
@@ -182,7 +182,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ── [Exp_82] A-2 가용 용량 (shim :8091 흡수) ─────────────────────────────────
-_CATALOG_PATH = os.environ.get("PRISM_CATALOG", "/etc/prism/catalog.json")
+_CATALOG_PATH = os.environ.get("KRAKEN_CATALOG", "/etc/kraken/catalog.json")
 
 
 def _capacity_response():
@@ -208,7 +208,7 @@ def _capacity_response():
               for k, v in tenants.items()]
     shm = _shm
     return {
-        "schema_version": "1.0", "node": os.environ.get("PRISM_NODE", "gpu-npu-server-02"),
+        "schema_version": "1.0", "node": os.environ.get("KRAKEN_NODE", "gpu-npu-server-02"),
         "devices": [{
             "uuid": _group_id, "kind": "gpu",
             "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
@@ -242,7 +242,7 @@ def _idle_check_loop(stop_event: threading.Event):
 def main():
     global _shm, _mm, _registry, _allocator, _overcommit, _scheduler, _group_id
 
-    parser = argparse.ArgumentParser(prog="prism_controller")
+    parser = argparse.ArgumentParser(prog="kraken_controller")
     parser.add_argument("--group",      default="default",  help="그룹 ID")
     parser.add_argument("--port",       type=int, default=8090)
     parser.add_argument("--sm",         type=int, default=0,
@@ -264,7 +264,7 @@ def main():
 
     # SHM 생성
     _shm, _mm = create_shm(_group_id, physical_sm, physical_mem)
-    print(f"[controller] SHM 생성: /dev/shm/prism_{_group_id} "
+    print(f"[controller] SHM 생성: /dev/shm/kraken_{_group_id} "
           f"({import_size()} bytes)")
 
     # 모듈 초기화
@@ -307,8 +307,8 @@ def main():
 
 def import_size():
     import ctypes
-    from prism_shm import PrismSharedState
-    return ctypes.sizeof(PrismSharedState)
+    from kraken_shm import KrakenSharedState
+    return ctypes.sizeof(KrakenSharedState)
 
 
 if __name__ == "__main__":

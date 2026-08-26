@@ -12,7 +12,7 @@
 import time
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shm'))
-from prism_shm import MAX_TENANTS, MODE_FREE, MODE_OVERCOMMIT, MODE_PROFILING, GATE_WAITING
+from kraken_shm import MAX_TENANTS, MODE_FREE, MODE_OVERCOMMIT, MODE_PROFILING, GATE_WAITING
 
 
 class OvercommitManager:

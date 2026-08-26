@@ -1,8 +1,8 @@
-# prism_shm.py
-# Python ctypes binding for prism_shm.h
+# kraken_shm.py
+# Python ctypes binding for kraken_shm.h
 # Used by: controller, monitor
 #
-# 레이아웃은 prism_shm.h와 정확히 일치해야 함.
+# 레이아웃은 kraken_shm.h와 정확히 일치해야 함.
 # ctypes.Structure.from_buffer() → mmap 위에 직접 매핑되므로
 # 필드 순서/크기/패딩을 C 컴파일러 결과와 동일하게 유지.
 
@@ -64,9 +64,9 @@ class SchedulerPolicy(ctypes.Structure):
     ]                                                         # total: 80
 
 
-# PrismSharedState
+# KrakenSharedState
 # pthread_mutex_t on Linux x86_64 = 40 bytes
-class PrismSharedState(ctypes.Structure):
+class KrakenSharedState(ctypes.Structure):
     _fields_ = [
         ("magic",                 ctypes.c_uint32),         # +0   (4)
         ("tenant_count",          ctypes.c_int32),          # +4   (4)
@@ -91,27 +91,27 @@ class PrismSharedState(ctypes.Structure):
 # ── SHM 유틸 ──────────────────────────────────────────────────────────────────
 
 def _shm_path(group_id: str) -> str:
-    """POSIX shm → Linux에서 /dev/shm/prism_{group_id}"""
-    return f"/dev/shm/prism_{group_id}"
+    """POSIX shm → Linux에서 /dev/shm/kraken_{group_id}"""
+    return f"/dev/shm/kraken_{group_id}"
 
 
 def create_shm(group_id: str,
                physical_sm: int,
-               physical_mem_mb: int) -> tuple["PrismSharedState", mmap.mmap]:
+               physical_mem_mb: int) -> tuple["KrakenSharedState", mmap.mmap]:
     """
     SHM 생성 및 초기화 (controller 전용).
-    반환: (PrismSharedState, mmap 객체)
+    반환: (KrakenSharedState, mmap 객체)
     mmap을 닫으면 매핑이 해제되므로 호출자가 생존 동안 보관해야 함.
     """
     path = _shm_path(group_id)
-    size = ctypes.sizeof(PrismSharedState)
+    size = ctypes.sizeof(KrakenSharedState)
 
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o666)
     os.ftruncate(fd, size)
     mm = mmap.mmap(fd, size)
     os.close(fd)
 
-    shm = PrismSharedState.from_buffer(mm)
+    shm = KrakenSharedState.from_buffer(mm)
     # 초기화
     shm.magic              = SHM_MAGIC
     shm.layout_version     = SHM_LAYOUT_VERSION
@@ -137,7 +137,7 @@ def create_shm(group_id: str,
     return shm, mm
 
 
-def _pthread_mutex_init(shm: "PrismSharedState") -> None:
+def _pthread_mutex_init(shm: "KrakenSharedState") -> None:
     """policy_mutex를 pthread_mutex_init으로 초기화."""
     try:
         libpthread = ctypes.CDLL("libpthread.so.0", use_errno=True)
@@ -147,17 +147,17 @@ def _pthread_mutex_init(shm: "PrismSharedState") -> None:
         pass  # pthread 없는 환경(macOS 등)에서는 무시
 
 
-def open_shm(group_id: str) -> tuple["PrismSharedState", mmap.mmap]:
+def open_shm(group_id: str) -> tuple["KrakenSharedState", mmap.mmap]:
     """
     기존 SHM에 읽기/쓰기 연결 (controller 재시작, schedctl, monitor 용).
-    반환: (PrismSharedState, mmap 객체)
+    반환: (KrakenSharedState, mmap 객체)
     """
     path = _shm_path(group_id)
-    size = ctypes.sizeof(PrismSharedState)
+    size = ctypes.sizeof(KrakenSharedState)
     fd = os.open(path, os.O_RDWR)
     mm = mmap.mmap(fd, size)
     os.close(fd)
-    shm = PrismSharedState.from_buffer(mm)
+    shm = KrakenSharedState.from_buffer(mm)
     if shm.magic != SHM_MAGIC:
         found = shm.magic
         del shm          # from_buffer 참조 해제 후 mmap 닫기

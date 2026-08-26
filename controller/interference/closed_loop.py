@@ -9,7 +9,7 @@
   - 히스테리시스: k_intervene(조임) > k_release(풂), 해제는 release_hold 초 안정 후에만 → 진동 방지.
   - 안전 기본값: victim 관측 부재/stale → 보수적 단계로 하강(WC 유지).
 
-센서: SYNC/obs_<name>.json (worker PRISM_OBS=1 리포터, 롤링 p95). 파일 기반(네트워킹 불요).
+센서: SYNC/obs_<name>.json (worker KRAKEN_OBS=1 리포터, 롤링 p95). 파일 기반(네트워킹 불요).
 액추에이터: controller :8090 /feeder/{arm,release,ratios} (런타임 가변, 10ms 틱 반영).
   ★Go 오토-와이어러(bless_feeder.go)는 델타 트리거(LSU/조합 변경 시에만) → 안정 파드셋에선 충돌 없음.
 
@@ -34,11 +34,11 @@ def emit_event(reason, msg, warn=False):
     """K8s Event 발행(오케스트로 A-4). 실패는 무시(측정 방해 금지)."""
     ev = {
         "apiVersion": "v1", "kind": "Event",
-        "metadata": {"generateName": "prism-loop-"},
+        "metadata": {"generateName": "kraken-loop-"},
         "involvedObject": {"kind": "Node", "name": "gpu-npu-server-02"},
         "reason": reason, "message": msg,
         "type": "Warning" if warn else "Normal",
-        "source": {"component": "prism-closed-loop"},
+        "source": {"component": "kraken-closed-loop"},
     }
     import subprocess
     try:
@@ -83,7 +83,7 @@ def main():
     ap.add_argument("--steps", default="1.0,0.7,0.5,0.4")       # ratio 사다리(0=NONE/release)
     ap.add_argument("--stale", type=float, default=3.0)
     ap.add_argument("--safe-level", type=int, default=1)        # 관측 부재 시 보수 단계
-    ap.add_argument("--log", default="/root/exp89_loop.log")
+    ap.add_argument("--log", default=os.environ.get("KRAKEN_LOOP_LOG", "/tmp/kraken_closed_loop.log"))
     ap.add_argument("--tag", default="")
     ap.add_argument("--emit-events", action="store_true")
     ap.add_argument("--duration", type=float, default=0, help=">0 이면 그 초 뒤 자동 종료")

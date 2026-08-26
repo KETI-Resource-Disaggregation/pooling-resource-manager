@@ -1,6 +1,6 @@
-// prism_shm.h
+// kraken_shm.h
 // Shared memory schema - single source of truth for C++ and Python
-// Used by: runtime (direct include), controller/monitor (via prism_shm.py ctypes)
+// Used by: runtime (direct include), controller/monitor (via kraken_shm.py ctypes)
 //
 // 주의: 모든 atomic 접근은 __atomic_* 빌트인으로 명시 수행.
 //   C11 _Atomic 키워드는 C++에서 지원 안 되므로 plain type으로 선언.
@@ -15,7 +15,7 @@
 #define SHM_MAGIC_V1    0x5052534D   // "PRSM" — 구 레이아웃 감지·명시적 거부용
 #define SHM_LAYOUT_VERSION 2
 #define TENANT_ID_LEN   48           // 현 최대 ID 17자("keti-gpu15-lsu178") ×2 이상 (Exp_41 §Phase1)
-#define SHM_PATH_FMT    "/prism_%s"  // /dev/shm/prism_{group_id}
+#define SHM_PATH_FMT    "/kraken_%s"  // /dev/shm/kraken_{group_id}
 
 // ── Gate state ────────────────────────────────────────────────────────────────
 typedef enum {
@@ -93,4 +93,4 @@ typedef struct {
     uint64_t         killer_policy_version;   // +840 (8)
 
     pthread_mutex_t  policy_mutex;            // +848 protect policy writes
-} PrismSharedState;
+} KrakenSharedState;

@@ -1,6 +1,6 @@
 """폐루프 HTTP 배선 — feeder/lifecycle 라우트 (Exp_26, G2·G3).
 
-prism_controller.py 에 최소 침습으로 얹는 디스패치 모듈. 상태는 여기서 보유.
+kraken_controller.py 에 최소 침습으로 얹는 디스패치 모듈. 상태는 여기서 보유.
 정책 '판단'은 없음 — 트리거는 (a) 수동 API, (b) 구독 규칙(호출자가 선언한
 transition→ratios 매핑; adaptive_map lookup 은 감사 기록용으로 첨부).
 

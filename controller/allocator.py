@@ -7,7 +7,7 @@
 import subprocess
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shm'))
-from prism_shm import MAX_TENANTS
+from kraken_shm import MAX_TENANTS
 
 
 class Allocator:
@@ -68,7 +68,7 @@ class Allocator:
     def get_env_for_tenant(self, tenant_idx: int) -> dict[str, str]:
         """
         테넌트 프로세스 실행 시 설정해야 할 환경변수 반환.
-        런처(prism_controller)가 이 dict를 subprocess env에 주입.
+        런처(kraken_controller)가 이 dict를 subprocess env에 주입.
         """
         shm  = self.shm
         alloc = shm.alloc[tenant_idx]
@@ -76,8 +76,8 @@ class Allocator:
         gid   = "default"  # group_id는 controller가 알고 있음
 
         return {
-            "PRISM_TENANT":               tid,
-            "PRISM_GROUP":                gid,
+            "KRAKEN_TENANT":               tid,
+            "KRAKEN_GROUP":                gid,
             "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(alloc.mps_pct),
         }
 
