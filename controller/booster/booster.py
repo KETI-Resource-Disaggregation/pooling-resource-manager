@@ -19,7 +19,7 @@
 
 mode="event" = TERM_PREDICTED 구독 (본체).
 mode="poll"  = OFF 기준선 — 기존 감지 경로의 로컬 대응물: 1.0s 폴링
-  (근거: prism_controller.py:186 idle 감지 루프 1초 간격 — 저장소 내 기존
+  (근거: kraken_controller.py:186 idle 감지 루프 1초 간격 — 저장소 내 기존
   회수 경로의 폴링 주기. watcher.go checkpoint 15s 는 K8s 경로라 제외).
   파이프라인 ②~⑤ 는 양 모드 동일 — 차이는 감지뿐 (단계 분해 대조용).
 """
@@ -29,7 +29,7 @@ import threading
 import time
 import urllib.request
 
-POLL_BASELINE_S = 1.0   # prism_controller.py:186 (기존 idle 감지 루프 1초 간격)
+POLL_BASELINE_S = 1.0   # kraken_controller.py:186 (기존 idle 감지 루프 1초 간격)
 
 
 def _pid_alive(pid):

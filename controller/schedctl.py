@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# schedctl.py — PRISM 컨트롤러 CLI
+# schedctl.py — KRAKEN 컨트롤러 CLI
 #
 # 사용 예:
 #   python schedctl.py register A --sm 40 --mem 4096 --weight 1.0
