@@ -38,6 +38,7 @@ from lifecycle import (StateMachine, SwapOrchestrator, IllegalTransition,
 from priority import PriorityManager              # [Exp_27]
 from booster import Booster                       # [Exp_28]
 from ratio import decide, bless_limit_pct
+from scanner import StderrSignals          # [Exp_126 4부]
 from ratio.adaptive_iface import lookup as map_lookup
 
 _feeder = None
@@ -46,9 +47,13 @@ _booster = None    # [Exp_28]
 _sm = None
 _ledger = None
 _subscriber = None
+_stderr = None
 _audit = []            # lifecycle 감사 로그 (상태 전이 + 결정)
 _swap_thread = None
 _swap_procs = {}       # standby name -> Popen
+
+
+_relocation_events = []   # [Exp_108 D-3] 재배치 추천 보관
 
 
 def init():
@@ -63,11 +68,29 @@ def init():
         sock_resolver=lambda t: _feeder.status()["tenants"].get(t, {}).get("sock"))
     # [Exp_28] Booster — feeder/ledger/decide/EventSubscriber 재사용
     # (match: TERM_PREDICTED 전용 — 기본 transition 필터와 별개 구독)
+    # [Exp_126 4부] stderr 신호 수집기 — 호출될 때만 동작한다(엔드포인트 opt-in).
+    global _stderr
+    _stderr = StderrSignals(os.environ.get("KRAKEN_SOCK_DIR", "/var/lib/kraken/socks"),
+                            send_fn=feeder_send)
     global _booster
     _booster = Booster(_feeder, _ledger, decide,
                        subscriber_factory=lambda p, h: EventSubscriber(
                            p, h, audit=_audit,
                            match=lambda e: e.get("event") == "TERM_PREDICTED"))
+    # [Exp_126 3-A] 종료 감지 자동 활성 — **기본 꺼짐**.
+    #   ★근거: Booster 는 자원을 **해지**하는 액추에이터다. 기본 켜짐으로 두면
+    #     오탐 하나가 남의 자원을 회수한다. 그렇다고 매 DS 재기동마다 사람이
+    #     POST 를 날려야 하면 실무에서 영영 안 켜진다. 그래서 KRAKEN_REDIST(Exp_121)
+    #     와 같은 형태 — 환경 변수로 켜고, 켜진 채 뜨면 로그에 남긴다.
+    if os.environ.get("KRAKEN_BOOSTER", "0") == "1":
+        ev = os.environ.get("KRAKEN_BOOSTER_EVENTS", "/var/lib/kraken/term_events.jsonl")
+        try:
+            _booster.enable("event", events_path=ev)
+            print(f"[loop_api] 종료 감지 자동 활성: mode=event events={ev}", flush=True)
+        except Exception as e:
+            # [Exp_107 T-5] 조용한 폴백 금지
+            print(f"[loop_api][경고] 종료 감지 자동 활성 실패: {e} — 꺼진 채로 진행한다",
+                  flush=True)
 
 
 def stop():
@@ -80,10 +103,21 @@ def stop():
 def handle_get(h, path):
     if path == "/feeder/status":
         h._send_json(_feeder.status())
+
+    elif path == "/events/relocation":      # [Exp_108 D-3] 발행된 추천 조회
+        h._send_json({"events": _relocation_events[-20:], "count": len(_relocation_events)})
     elif path == "/feeder/occupancy":
         h._send_json(_feeder.sample_occupancy())
     elif path == "/priority/status":              # [Exp_27]
         h._send_json(_priority.status())
+    elif path == "/scanner/stderr":               # [Exp_126 4부]
+        # libbless stderr 신호 — 호출 시에만 수집한다(주기 관측용, 고빈도 아님).
+        out, tenants = {}, _feeder.status().get("tenants", {})
+        for name, t in tenants.items():
+            r = _stderr.collect(name, t.get("sock"))
+            if r is not None:
+                out[name] = r
+        h._send_json({"tenants": out, "n": len(out), "asked": len(tenants)})
     elif path == "/booster/status":               # [Exp_28]
         h._send_json(_booster.status())
     elif path == "/lifecycle/state":
@@ -96,7 +130,17 @@ def handle_get(h, path):
 
 def handle_post(h, path, body):
     try:
-        if path == "/feeder/register":
+        # [Exp_108 D-3] 재배치 추천 수신 — 3단계 산출물. **실행하지 않고** 보관·중계만
+        #   한다(오케스트로 수집 경로·고려대 스케줄링 계층이 소비 대상).
+        if path == "/events/relocation":
+            payload = body or {}
+            print(f"[loop_api] RelocationRecommendation: "
+                  f"aggressor={payload.get('aggressor')} reason={payload.get('reason')}",
+                  flush=True)
+            _relocation_events.append(payload)
+            del _relocation_events[:-50]      # 최근 50건만 보관
+            h._send_json({"ok": True, "queued": len(_relocation_events)})
+        elif path == "/feeder/register":
             # resource (Exp_45): "gpu" 기본 | "npu"=npu-proxy 소켓 경유
             # (채널 계약 동일 — NPU 는 시간 축 단독, s 미적용)
             _feeder.register(body["tenant"], body["sock"], body["log"],

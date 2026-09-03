@@ -69,8 +69,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # [Exp_26] 폐루프 라우트 위임 ([Exp_27] /priority/, [Exp_28] /booster/ 추가)
-        if self.path.startswith(("/feeder/", "/lifecycle/", "/priority/",
-                                 "/booster/")):
+        if self.path.startswith(("/feeder/", "/lifecycle/", "/events/", "/priority/",
+                                 "/booster/", "/scanner/")):   # [Exp_126]
             return loop_api.handle_get(self, self.path)
         if self.path == "/status":
             shm = _shm
@@ -101,8 +101,9 @@ class Handler(BaseHTTPRequestHandler):
 
         # [Exp_26] 폐루프 라우트 위임 ([Exp_27] /priority,/urgent, [Exp_28]
         # /booster 추가 — 기존 /policy/priority(shm write, deprecated)와 별개)
-        if self.path.startswith(("/feeder/", "/lifecycle/", "/subscribe",
-                                 "/priority", "/urgent", "/booster/")):
+        if self.path.startswith(("/feeder/", "/lifecycle/", "/events/", "/subscribe",
+                                 "/priority", "/urgent", "/booster/",
+                                 "/scanner/")):   # [Exp_126]
             return loop_api.handle_post(self, self.path, body)
 
         if self.path == "/register":
@@ -148,7 +149,28 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/policy/weights":
             weights = body.get("weights", [])
             _scheduler.set_weights(weights)
-            self._send_json({"ok": True, "version": _scheduler.get_policy_version()})
+            # [Exp_107 T-3] weight 를 feeder 까지 배선한다.
+            #   Exp_106 N-1: SHM policy.weights 에는 기록됐으나 게이트를 움직이는
+            #   feeder 가 그 값을 보지 않아 weight 2:1/4:1 에서도 처리량 비가 1.00 이었다.
+            #   ★SHM 판독 책임은 여기(controller)에 둔다 — feeder 는 순수 분배기로 남긴다.
+            wmap, unmapped = {}, 0
+            try:
+                shm = _scheduler.shm
+                for i, wv in enumerate(weights[:shm.tenant_count]):
+                    tid = shm.alloc[i].tenant_id.decode().rstrip("\x00")
+                    if tid:
+                        wmap[tid] = float(wv)
+                    else:
+                        unmapped += 1
+                loop_api._feeder.set_weights(wmap)
+            except Exception as e:
+                # [Exp_107 T-5] 조용한 폴백 금지
+                print(f"[controller][경고] weight→feeder 배선 실패 err={e!r} "
+                      f"→ feeder 는 LSU 비례만 적용한다(weight 무시).", flush=True)
+            if unmapped:
+                print(f"[controller][경고] weight {unmapped}건이 tenant_id 미매핑 — 무시됨.", flush=True)
+            self._send_json({"ok": True, "version": _scheduler.get_policy_version(),
+                             "feeder_weights": wmap})
 
         elif self.path == "/policy/round":
             dur = int(body.get("duration_us", 100_000))
@@ -183,6 +205,25 @@ class Handler(BaseHTTPRequestHandler):
 
 # ── [Exp_82] A-2 가용 용량 (shim :8091 흡수) ─────────────────────────────────
 _CATALOG_PATH = os.environ.get("KRAKEN_CATALOG", "/etc/kraken/catalog.json")
+_CAT_WARNED = False   # [Exp_107 T-5] 폴백 경고 1회만
+_FEEDER_WARNED = False
+_NODE_WARNED = False
+
+
+def _node_name():
+    """[Exp_107 T-5] 노드명 폴백 고지.
+    KRAKEN_NODE 미설정 시 개발 노드명으로 폴백한다 — 다른 노드에 배포하면
+    /capacity 가 잘못된 노드를 가리키는데 아무 신호가 없다(Exp_103 E-3 하드코딩 10건).
+    """
+    v = os.environ.get("KRAKEN_NODE")
+    if v:
+        return v
+    global _NODE_WARNED
+    if not _NODE_WARNED:
+        _NODE_WARNED = True
+        print("[controller][경고] KRAKEN_NODE 미설정 → 기본값 'gpu-npu-server-02' 사용. "
+              "다른 노드라면 /capacity 의 node 필드가 틀린다.", flush=True)
+    return "gpu-npu-server-02"
 
 
 def _capacity_response():
@@ -194,12 +235,28 @@ def _capacity_response():
         devs = [d for d in cat.get("devices", {}).values() if d.get("measured")]
         if devs:
             phys_lsu = max(d["lsu"] for d in devs)
-    except Exception:
-        pass                         # catalog 미접근 → 보수 기본(178/1.0)
+    except Exception as e:
+        # [Exp_107 T-5] 조용한 폴백 금지 — 무엇을 못 읽었고 무엇으로 대체했는지 남긴다.
+        #   Exp_106 N-2: controller 에 catalog 가 미마운트인데 아무 경고 없이 178/1.0 으로
+        #   폴백해, allocatable(214)과 /capacity(178)가 어긋난 것을 아무도 몰랐다.
+        global _CAT_WARNED
+        if not _CAT_WARNED:
+            _CAT_WARNED = True
+            print(f"[controller][경고] catalog 읽기 실패 path={_CATALOG_PATH} err={e!r} "
+                  f"→ 기본값 폴백(physical_lsu=178, overcommit_factor=1.0). "
+                  f"/capacity 가 실제 광고와 어긋날 수 있다.", flush=True)
     adv_lsu = round(phys_lsu * factor)
     try:
         tenants = loop_api._feeder.status().get("tenants", {})
-    except Exception:
+    except Exception as e:
+        # [Exp_107 T-5] 조용한 폴백 금지 — 이게 비면 allocated_lsu·slices 가 0 으로
+        #   보고되어 "아무도 안 쓰는 중"처럼 보인다. 실제 배치와 어긋난다.
+        global _FEEDER_WARNED
+        if not _FEEDER_WARNED:
+            _FEEDER_WARNED = True
+            print(f"[controller][경고] feeder status 조회 실패 err={e!r} "
+                  f"→ tenants={{}} 폴백. /capacity 의 allocated_lsu·slices 가 "
+                  f"실제 배치와 어긋난다.", flush=True)
         tenants = {}
     allocated = sum(round(v.get("ratio", 0) * phys_lsu) for v in tenants.values())
     ratio = round(allocated / phys_lsu, 3) if phys_lsu else 0.0
@@ -208,7 +265,7 @@ def _capacity_response():
               for k, v in tenants.items()]
     shm = _shm
     return {
-        "schema_version": "1.0", "node": os.environ.get("KRAKEN_NODE", "gpu-npu-server-02"),
+        "schema_version": "1.0", "node": _node_name(),
         "devices": [{
             "uuid": _group_id, "kind": "gpu",
             "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
