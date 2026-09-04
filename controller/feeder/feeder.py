@@ -48,6 +48,73 @@ REDIST_DWELL = int(os.environ.get("KRAKEN_REDIST_DWELL", "10"))
 #   않아야 한다. 25 tick = 250ms → 여유 4%, HOLD 5 회에 1.25s 만에 전환된다.
 REDIST_EVAL_TICKS = int(os.environ.get("KRAKEN_REDIST_EVAL_TICKS", "25"))
 
+
+# ── [Exp_135 5부] 제어 적용 여부 탐지 ─────────────────────────────────────────
+#   ★소켓이 살아 있고 feeder 에 armed 로 등록돼도 **제어가 걸렸다는 뜻이 아니다.**
+#     Exp_135 3부 실측(o4): 워크로드가 `LD_PRELOAD=남의것:libbless.so` 로 뜨고
+#     남의 .so 가 libcudart 를 직접 잡아 체인을 끊으면, libbless 는 적재되고
+#     init 로그 9줄에 sm_limit 까지 찍히는데 cudaLaunchKernel 후킹은 안 걸린다.
+#     처리량이 제어 없음(57.83)과 같은 57.82 로 나오고, 소켓·feeder 지표는 전부 정상이다.
+#     갈리는 것은 **게이트를 통과한 커널 수** 하나뿐이다(정상 57,042→105,712 / o4 0→0).
+#   기본 꺼짐. 이번 범위는 **드러내기까지**이며 배치를 막지 않는다.
+CTLCHECK_ON = os.environ.get("KRAKEN_CTLCHECK", "0") == "1"
+CTLCHECK_EVAL_TICKS = int(os.environ.get("KRAKEN_CTLCHECK_TICKS", "200"))
+
+
+def _ctlcheck_grace_s():
+    """유예 = 소켓 등장 뒤 커널을 기다려 주는 시간. **임의 상수가 아니다.**
+
+    근거 둘 (Exp_135 5-C 실측):
+      · 소켓 등장(=libbless init, 첫 CUDA 호출) → 첫 커널까지 **0.34~0.88 s**.
+        컨텍스트가 생기면 커널은 곧바로 흐른다.
+      · 모델 로드는 약 25 s 인데, 소켓은 그 **안에서** 생긴다(로드도 커널을 쓴다).
+    기본 30 s = 실측 최대(0.88 s)의 34배이자 모델 로드 시간보다 길다. 컨텍스트를
+    만든 뒤 CPU 전처리가 길어지는 워크로드에서도 오탐이 나지 않는 쪽으로 잡았다.
+    탐지는 로그만 내므로 늦는 비용은 없고 오탐의 비용만 있다 — 넉넉한 쪽이 맞다.
+    """
+    try:
+        return max(1.0, float(os.environ.get("KRAKEN_CTLCHECK_GRACE_S", "30")))
+    except ValueError:
+        return 30.0
+
+
+CTLCHECK_GRACE_S = _ctlcheck_grace_s()
+
+
+def _ctl_warn(msg):
+    print(f"[feeder][제어미적용] {msg}", flush=True)
+
+
+def _redist_cap_ticks():
+    """[Exp_130 1-A] **결정 지평**(잔량 클램프 상한)의 틱 수.
+
+    ★왜 분리하는가 — Exp_129 4-1. `HOLD` 하나가 서로 다른 두 일을 했다:
+      (ㄱ) 히스테리시스 — 같은 판정 연속 N회여야 전환 (왕복 방지)
+      (ㄴ) 결정 지평   — 잔량 클램프 `cap = per_tick × HOLD × win`
+      묶여 있어 HOLD 를 낮추면 단독 재분배는 걸리지만(재현율 30→100%)
+      쌍 조건 진동이 113배로 늘고 총처리량이 9.9% 떨어졌다(Exp_129 1-D).
+      **둘은 다른 양이다.** 지평만 줄이고 히스테리시스는 유지할 수 있어야 한다.
+
+    ★기본값은 기존 동작 그대로(`HOLD × win` = 125틱 = 1.25초 분)를 유지한다.
+      바꾸는 것은 설정으로 하고, 검증 뒤에 기본값 변경을 판단한다(Exp_130 5-A).
+    """
+    raw = os.environ.get("KRAKEN_REDIST_CAP_TICKS")
+    if raw is None:
+        return REDIST_HOLD * REDIST_EVAL_TICKS
+    try:
+        v = int(raw)
+    except ValueError:
+        v = 0
+    if v <= 0:
+        # [Exp_107 T-5] 조용한 폴백 금지
+        _redist_warn(f"KRAKEN_REDIST_CAP_TICKS={raw!r} 를 해석할 수 없다(양의 정수) → "
+                     f"기본값 HOLD×win={REDIST_HOLD * REDIST_EVAL_TICKS} 사용")
+        return REDIST_HOLD * REDIST_EVAL_TICKS
+    return v
+
+
+
+
 _REDIST_WARNED = set()
 
 
@@ -56,6 +123,10 @@ def _redist_warn(msg):
     if msg not in _REDIST_WARNED:
         _REDIST_WARNED.add(msg)
         print(f"[feeder][경고] 재분배: {msg}", flush=True)
+
+
+# [Exp_130] 결정 지평 확정 — 경고 헬퍼가 정의된 뒤여야 한다(폴백 시 경고).
+REDIST_CAP_TICKS = _redist_cap_ticks()
 
 
 def _send(sock_path, msg):
@@ -128,6 +199,10 @@ class TimeCreditFeeder:
         self._granted = {}        # name -> 누적 부여 예산(μs)
         self._redist_win = {}     # name -> (granted_cum, charged_cum) 직전 평가창
         self._redist_trace = []   # [Exp_121 2-E] 배분값 시간 궤적
+        # [Exp_135 5부] name -> {t_seen, kernels, applied, warned}
+        self._ctl = {}
+        self._ctl_eval_t = 0.0
+        self._ctl_probe_due = False
         self._env_scale = float(env_scale)
         self._env_policy = "strict"   # 기본값 = 현행 동작 (Exp_40 opt-in)
         self._send = send_fn
@@ -174,6 +249,10 @@ class TimeCreditFeeder:
                                    "ratio": float(time_ratio), "armed": False,
                                    "resource": str(resource)}
 
+    def _ctl_forget(self, name):
+        """[Exp_135] devID 재사용 오염 방지 — 해제 시 판정 상태를 지운다."""
+        self._ctl.pop(name, None)
+
     def _redist_forget(self, name):
         """[Exp_121] 테넌트가 빠지면 재구성 상태도 버린다(다음 입주자 오염 방지)."""
         self._redist_state.pop(name, None)
@@ -186,6 +265,7 @@ class TimeCreditFeeder:
             self._tenants.pop(name, None)
             self._last_sample.pop(name, None)
             self._redist_forget(name)
+            self._ctl_forget(name)
 
     def arm(self, name):
         """게이트 무장 (Exp_16: time_mode 1 + time_credit 0)."""
@@ -299,7 +379,10 @@ class TimeCreditFeeder:
         self._redist_eval_t = now
         self._redist_probe_due = True     # 이번 평가 뒤 한 번만 프로브
         win = max(1, REDIST_EVAL_TICKS)
-        want, slack_us, allow_us = [], {}, {}
+        # [Exp_129 1-B] streak/hungry 를 궤적에 함께 싣는다. slack 만으로는
+        #   "왜 전환이 안 됐는지"(streak 리셋)를 볼 수 없다 — 관측 코드는 판정에
+        #   쓰이는 상태를 다 내야 한다(T-5 파생).
+        want, slack_us, allow_us, dbg = [], {}, {}, {}
         for n, t in armed.items():
             st_ts = read_time_stats(t["log"])
             state = self._redist_state.setdefault(
@@ -326,7 +409,8 @@ class TimeCreditFeeder:
             #   (HOLD × 창 = 상태를 바꾸는 데 필요한 시간)의 부여량으로 양쪽을 자른다.
             #   그 밖의 값은 판정에 추가 정보를 주지 않는다.
             per_tick = pool * eff[n]
-            cap = per_tick * REDIST_HOLD * win
+            # [Exp_130] 결정 지평은 히스테리시스(HOLD)와 **독립**이다
+            cap = per_tick * REDIST_CAP_TICKS
             if abs(bal) > cap:
                 signed = cap if bal > 0 else -cap
                 self._redist_win[n] = (g_cum - signed, c_cum)   # 앵커를 당겨 클램프
@@ -339,6 +423,7 @@ class TimeCreditFeeder:
             allow = per_tick * REDIST_HUNGRY_FRAC   # tick 하나 분 부여량
             slack_us[n] = int(bal)
             allow_us[n] = int(allow)
+            cap_us = int(cap)
             cur = (bal <= allow)
             if cur == state["hungry"]:
                 state["streak"] = 0
@@ -350,6 +435,8 @@ class TimeCreditFeeder:
                     state["hungry"] = cur
                     state["since"] = now
                     state["streak"] = 0
+            dbg[n] = {"streak": state["streak"], "hungry": state["hungry"],
+                      "cur": bool(cur)}
             if state["hungry"]:
                 want.append(n)
         wtot = sum(eff[n] for n in want)
@@ -357,7 +444,8 @@ class TimeCreditFeeder:
                if wtot > 0 else {})
         self._redist_extra = out
         snap = {"t": round(now, 3), "idle": round(idle, 4),
-                "slack_us": slack_us, "allow_us": allow_us,
+                "slack_us": slack_us, "allow_us": allow_us, "state": dbg,
+                "cap_ticks": REDIST_CAP_TICKS,
                 "want": sorted(want), "extra_us": out}
         self._redist_last = snap
         self._redist_trace.append(snap)
@@ -399,7 +487,66 @@ class TimeCreditFeeder:
             if REDIST_ON and bud and self._redist_probe_due:
                 self._redist_probe_due = False
                 self._redist_probe(list(bud))
+            if CTLCHECK_ON and bud:
+                self._ctlcheck(list(bud))
             self._sleep(TICK_S)
+
+    # ---- [Exp_135 5부] 제어 적용 여부 판정 ----
+    def _ctlcheck(self, names):
+        """armed 테넌트의 게이트 통과 커널이 실제로 늘고 있는지 본다.
+
+        판정은 **읽고 나서 다음 프로브**를 낸다(재분배와 같은 순서) — 항상 한
+        주기 전 값을 보므로 정착 시간이 확보된다.
+        """
+        now = time.time()
+        if (now - self._ctl_eval_t) < CTLCHECK_EVAL_TICKS * TICK_S:
+            return
+        self._ctl_eval_t = now
+        with self._lock:
+            tenants = {n: dict(self._tenants[n]) for n in names
+                       if n in self._tenants}
+        for n, t in tenants.items():
+            st = self._ctl.setdefault(n, {"t_seen": now, "kernels": None,
+                                          "applied": None, "warned": False})
+            if self._ctl_probe_due:
+                cur = read_time_stats(t["log"])
+                k = cur[1] if cur else None
+                if k is not None:
+                    if k > 0:
+                        if st["applied"] is not True:
+                            st["applied"] = True
+                        st["kernels"] = k
+                    else:
+                        st["kernels"] = 0
+                        if (now - st["t_seen"]) > CTLCHECK_GRACE_S:
+                            st["applied"] = False
+                            if not st["warned"]:
+                                st["warned"] = True
+                                _ctl_warn(
+                                    f"{n}: 소켓·등록은 정상인데 게이트 통과 커널이"
+                                    f" {int(now - st['t_seen'])}s 동안 0 이다 —"
+                                    " libbless 인터포지션이 안 걸린 것으로 본다."
+                                    " LD_PRELOAD 앞에 다른 .so 가 있는지 확인하라"
+                                    f" (log={t['log']})")
+                elif (now - st["t_seen"]) > CTLCHECK_GRACE_S and not st["warned"]:
+                    # [T-5] 못 읽는 것을 '정상'으로 넘기지 않는다
+                    st["warned"] = True
+                    _ctl_warn(f"{n}: time_stats 를 읽지 못한다 — 판정 보류"
+                              f" (log={t['log']})")
+        # 다음 평가에서 읽을 값을 만들어 둔다
+        self._ctl_probe_due = True
+        with self._lock:
+            socks = [self._tenants[n]["sock"] for n in names
+                     if n in self._tenants]
+        for sk in socks:
+            self._send(sk, "time_stats")
+
+    def ctlcheck_status(self):
+        return {"on": CTLCHECK_ON, "grace_s": CTLCHECK_GRACE_S,
+                "eval_ticks": CTLCHECK_EVAL_TICKS,
+                "tenants": {n: {"applied": v["applied"], "kernels": v["kernels"],
+                                "age_s": round(time.time() - v["t_seen"], 1)}
+                            for n, v in self._ctl.items()}}
 
     # ---- 상태 조회 (점유 실측) ----
     def sample_occupancy(self, settle_s=0.1):
@@ -457,5 +604,8 @@ class TimeCreditFeeder:
                            "hungry_frac": REDIST_HUNGRY_FRAC,
                            "hold": REDIST_HOLD, "dwell": REDIST_DWELL,
                            "eval_ticks": REDIST_EVAL_TICKS,
+                           "cap_ticks": REDIST_CAP_TICKS,
                            "last": self._redist_last,
-                           "trace": self._redist_trace[-200:]}}
+                           "trace": self._redist_trace[-200:]},
+                # [Exp_135 5부] 제어가 실제로 걸렸는지
+                "ctlcheck": self.ctlcheck_status()}

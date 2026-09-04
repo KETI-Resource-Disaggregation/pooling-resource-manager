@@ -181,9 +181,12 @@ def handle_post(h, path, body):
         elif path == "/booster/disable":           # [Exp_28]
             _booster.disable()
             h._send_json({"ok": True})
-        elif path == "/booster/register":          # [Exp_28]
-            _booster.register_tenant(body["tenant"], body["pid"], body["gpu"])
+        elif path == "/booster/register":          # [Exp_28] +[Exp_134] alive_path
+            _booster.register_tenant(body["tenant"], body.get("pid", 0),
+                                     body["gpu"], body.get("alive_path"))
             h._send_json({"ok": True})
+        elif path == "/booster/deregister":        # [Exp_134] 파드 종료 시 해제
+            h._send_json({"ok": _booster.deregister_tenant(body["tenant"])})
         elif path == "/booster/pending":           # [Exp_28]
             _booster.add_pending(body["r"], body["workload_class"])
             h._send_json({"ok": True})

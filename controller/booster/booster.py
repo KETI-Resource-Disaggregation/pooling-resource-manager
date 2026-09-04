@@ -23,7 +23,9 @@ mode="poll"  = OFF 기준선 — 기존 감지 경로의 로컬 대응물: 1.0s 
   회수 경로의 폴링 주기. watcher.go checkpoint 15s 는 K8s 경로라 제외).
   파이프라인 ②~⑤ 는 양 모드 동일 — 차이는 감지뿐 (단계 분해 대조용).
 """
+import glob
 import json
+import socket
 import os
 import threading
 import time
@@ -34,6 +36,55 @@ POLL_BASELINE_S = 1.0   # kraken_controller.py:186 (기존 idle 감지 루프 1�
 
 def _pid_alive(pid):
     return os.path.exists(f"/proc/{pid}")
+
+
+def _sock_alive(pattern):
+    """[Exp_135 2부] 소켓 **파일 존재**가 아니라 **연결 가능 여부**로 판정한다.
+
+    ★Exp_134 는 glob 만 봤다. 파드를 SIGKILL 로 죽이면 libbless 가 소켓을 지울
+      기회가 없어 파일이 그대로 남는다(Exp_135 1-C 실측: 잔재 소켓 연결 →
+      ECONNREFUSED(111), 그런데 glob 은 '살아있음'이라 답한다). 죽은 소켓을
+      살아있다고 읽으면 Booster 는 **영영 회수하지 않는다**(반대 방향 오류라
+      자원을 뺏지는 않지만, 감지가 무의미해진다).
+    device-plugin 의 `sockAlive()`(Exp_112)와 같은 판정을 파이썬으로 옮긴 것이다 —
+    그쪽은 이미 이 방어가 있었고 feeder 는 속지 않는다(Exp_135 1-C 확인).
+    """
+    for p in glob.glob(pattern):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            s.connect(p)
+            s.send(b"ping")       # 리스너 없으면 ECONNREFUSED
+            return True
+        except OSError:
+            continue
+        finally:
+            s.close()
+    return False
+
+
+def _alive(info):
+    """[Exp_134] 생존 신호. **하나라도 살아 있다고 하면 살아 있는 것으로 본다.**
+
+    라이브 배선에서 pid 기반 재확인이 그대로는 못 쓴다:
+      · Allocate 시점엔 워크로드 프로세스가 아직 없다 → pid 를 모른다
+      · libbless 소켓명의 pid 는 **컨테이너 pid** 라 호스트 /proc 와 다르다
+      · MPS 하에서 nvidia-smi 가 보고하는 pid 는 **MPS 서버**다(Exp_134 §4)
+    그래서 pid 를 못 쓰는 자리에서는 **libbless 제어 소켓의 존재**를 생존 신호로
+    쓴다. bless_feeder 가 이미 소켓 소멸을 해제 트리거로 쓰고 있어 검증된 신호다.
+    ★pid=0(미상)을 `/proc/0` 부재로 읽어 '죽었다'고 판정하면 **살아 있는 작업의
+      자원을 회수한다.** 그래서 신호는 OR 이고, 신호가 하나도 없으면 죽었다고
+      말하지 않는다(호출자가 armed 로 한 번 더 막는다).
+    """
+    sigs = []
+    pid = int(info.get("pid") or 0)
+    if pid > 0:
+        sigs.append(_pid_alive(pid))
+    ap = info.get("alive_path")
+    if ap:
+        sigs.append(_sock_alive(ap))
+    if not sigs:
+        return True              # 판단 근거 없음 → 살아 있다고 본다(보수)
+    return any(sigs)
 
 
 class Booster:
@@ -53,6 +104,8 @@ class Booster:
         self._subscriber = None
         self._poll_thread = None
         self._poll_stop = threading.Event()
+        self._arm_thread = None
+        self._arm_stop = threading.Event()
         self.audit = []
         self.actions = []         # 완료된 해지 액션 (단계 타임스탬프)
 
@@ -61,10 +114,55 @@ class Booster:
             self.audit.append({"t": round(time.time(), 6), "kind": kind, **kw})
 
     # ---- 등록 ----
-    def register_tenant(self, name, pid, gpu):
+    def register_tenant(self, name, pid, gpu, alive_path=None):
+        """[Exp_134] alive_path = 생존 신호 glob(예: <sockdir>/<devID>/bless-*.sock).
+
+        ★등록 즉시 회수 대상이 되지 않는다 — `armed=False` 로 들어가고, 생존
+        신호가 **한 번이라도 관측된 뒤**에만 무장된다. Allocate 시점엔 워크로드가
+        아직 뜨지 않아 신호가 없고, 그 상태를 '죽었다'로 읽으면 배정 직후의 작업을
+        회수한다. class 선기록·podref 가 pending 대기열을 두는 것과 같은 이유다
+        (T-7 — Exp_126 §5-4 에서 이 둘을 빠뜨려 사고가 났다).
+        """
+        info = {"pid": int(pid or 0), "gpu": str(gpu),
+                "alive_path": alive_path, "armed": False,
+                "t_reg": round(time.time(), 6)}
+        # 호출자가 **pid 를 알고** 등록하면 그 자리에서 무장한다 — 등록자가
+        # 대상을 특정했다는 뜻이므로 Exp_28 수동 등록 계약 그대로다.
+        # pid 를 모르는 자동 등록(Allocate, pid=0)만 생존 신호가 처음 보일
+        # 때까지 무장을 미룬다 — 그 구간을 '죽었다'로 읽으면 배정 직후의
+        # 작업을 회수한다.
+        if info["pid"] > 0:
+            info["armed"] = True
         with self._lock:
-            self._tenants[name] = {"pid": int(pid), "gpu": str(gpu)}
-        self._log("tenant_registered", tenant=name, pid=pid, gpu=gpu)
+            self._tenants[name] = info
+        self._log("tenant_registered", tenant=name, pid=pid, gpu=gpu,
+                  alive_path=alive_path)
+
+    def deregister_tenant(self, name):
+        """[Exp_134] 파드 종료 시 등록 해제. **devID 재사용 오염 방지** —
+        남겨두면 다음 파드가 같은 devID 를 받았을 때 이전 등록의 pid/alive_path 로
+        판정한다(Exp_112 가 bless 소켓에서 겪은 것과 같은 함정)."""
+        with self._lock:
+            existed = self._tenants.pop(name, None) is not None
+        self._log("tenant_deregistered", tenant=name, existed=existed)
+        return existed
+
+    def _arm_loop(self):
+        """생존 신호가 처음 보이면 무장. 무장 전에는 회수하지 않는다."""
+        while not self._arm_stop.is_set():
+            with self._lock:
+                items = list(self._tenants.items())
+            for name, info in items:
+                if info.get("armed"):
+                    continue
+                if _alive(info) and (info.get("pid") or info.get("alive_path")):
+                    if info.get("alive_path") and not _sock_alive(info["alive_path"]):
+                        continue          # 신호 없음 = 아직 안 떴다
+                    with self._lock:
+                        if name in self._tenants:
+                            self._tenants[name]["armed"] = True
+                    self._log("tenant_armed", tenant=name)
+            self._arm_stop.wait(0.5)
 
     def add_pending(self, r, workload_class):
         with self._lock:
@@ -78,6 +176,9 @@ class Booster:
         self._mode = mode
         self._base_url = base_url
         self._enabled = True
+        self._arm_stop.clear()
+        self._arm_thread = threading.Thread(target=self._arm_loop, daemon=True)
+        self._arm_thread.start()
         if mode == "event":
             self._subscriber = self._sub_factory(events_path, self._on_event)
             self._subscriber.start()
@@ -99,6 +200,10 @@ class Booster:
             self._poll_stop.set()
             self._poll_thread.join(timeout=2.0)
             self._poll_thread = None
+        if self._arm_thread:
+            self._arm_stop.set()
+            self._arm_thread.join(timeout=2.0)
+            self._arm_thread = None
         self._log("disabled")
 
     # ---- 감지: event 모드 ----
@@ -134,7 +239,7 @@ class Booster:
             with self._lock:
                 snapshot = dict(self._tenants)
             for name, v in snapshot.items():
-                if not _pid_alive(v["pid"]):
+                if v.get("armed") and not _alive(v):
                     self._run_pipeline(name, time.time(), trigger="poll_1s")
             self._poll_stop.wait(POLL_BASELINE_S)
 
@@ -146,8 +251,13 @@ class Booster:
             return
         act = {"tenant": tenant, "trigger": trigger, "event_ts": event_ts,
                "t_detect": round(t_detect, 6)}
+        # ⓪ 무장 확인 — 생존 신호를 한 번도 못 본 테넌트는 회수하지 않는다 (Exp_134)
+        if not info.get("armed"):
+            act["aborted"] = "not_armed"
+            self._log("action_aborted_not_armed", **act)
+            return
         # ① 생존 재확인 (오탐 방어 ②) — 즉시 1회, grace 없음
-        if _pid_alive(info["pid"]):
+        if _alive(info):
             act["aborted"] = "alive_recheck"
             self._log("action_aborted_alive", **act)
             return
