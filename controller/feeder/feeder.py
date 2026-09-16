@@ -19,6 +19,32 @@ import threading
 import time
 
 TICK_S = 0.010            # Exp_16 실측 검증 tick (10ms) — 오차 ≤0.007 의 조건
+
+# [Exp_141 2부] 몫 재설정의 기본 임대 수명(s) — set_ratios 가 lease_s 를 안 줘도
+#   이 만료가 붙는다(무기한 고착 경로 제거).
+# ★유도 (임의 상수 아님): 갱신 주체의 실제 주기에서 나온다.
+#   - ④ closed_loop  : --interval 0.5s, 개입 중 매 루프 renew_lease (Exp_138 3-D)
+#   - 적응형 slice_loop: --interval 1.0s, 조절 중 매 루프 재전송 (Exp_141 보강)
+#   최장 갱신 주기 1.0s × 3배 = 3.0s — 일시 지연(관측 파일 stale·HTTP 재시도)을
+#   2회까지 흡수하면서, 갱신 주체가 죽은 뒤 고착이 3초를 넘지 않는다.
+#   Exp_138 3-D 가 ④ 기준(0.5s×6)으로 잡은 기본값과 같은 수로 수렴한다.
+#   명시 opt-out: lease_s<=0 → 무기한(계약 재정규화 등 — 호출자가 책임, 이력에 남김).
+RATIO_LEASE_DEFAULT_S = float(os.environ.get("KRAKEN_RATIO_LEASE_S", "3.0"))
+
+# ── [Exp_138 3-D] 몫 재설정 임대(lease) ──────────────────────────────────────
+# ★왜 필요한가 (Exp_138 0-B 실측). set_ratios 는 계약값을 남기지 않고 t["ratio"] 를
+#   제자리에서 덮어썼다. 원복 경로는 closed_loop 의 finally 블록뿐인데 **SIGKILL 이면
+#   실행되지 않는다.** Go 와이어러도 LSU·소켓이 그대로면 재등록하지 않으므로, 안정
+#   파드셋에서는 내려간 몫을 아무도 되돌리지 않는다 — kill -9 한 번으로 몫이 0.4 에
+#   영구 고정되고 /feeder/status 는 정상으로 보인다(T-5 최악급).
+#
+# 고침: 재설정에 **만료 시각**을 붙인다. 갱신이 끊기면 feeder 가 스스로 계약값으로
+#   되돌린다. 제어기의 정리 코드가 도는지에 의존하지 않는 **구조적** 복귀다.
+#
+# ★RATIO_LEASE_S 는 새 상수가 아니다 — closed_loop 이 자기 관측을 stale 로 보는
+#   기준(--stale 기본 3.0s)을 그대로 가져왔다. "3초 넘게 소식이 없으면 믿지 않는다"는
+#   판단을 양쪽이 같은 값으로 쓴다.
+RATIO_LEASE_S = float(os.environ.get("KRAKEN_RATIO_LEASE_S", "3.0"))
 DEFAULT_ENV_SCALE = 1.0   # in-envelope Σ=TICK (Exp_16). 완화(1.6 등)는 옵션
 
 # 봉투 정책 (Exp_40): strict = Σ(등록 ratio) ≤ 1.0 강제 (현행 의미론).
@@ -203,6 +229,11 @@ class TimeCreditFeeder:
         self._ctl = {}
         self._ctl_eval_t = 0.0
         self._ctl_probe_due = False
+        # [Exp_138 3-D → Exp_141] name -> {"expire": 만료 시각, "reason": 사유}
+        #   (계약값은 여기 스냅샷하지 않는다 — 진실은 t["contract"] 하나, Exp_141 1부)
+        self._ratio_lease = {}
+        self._lease_restores = []       # 복귀 이력 최근분 (관측 가능성)
+        self._lease_restore_total = 0   # [Exp_141 2부] 복귀 누적 카운터 (조용한 복귀 금지)
         self._env_scale = float(env_scale)
         self._env_policy = "strict"   # 기본값 = 현행 동작 (Exp_40 opt-in)
         self._send = send_fn
@@ -245,9 +276,19 @@ class TimeCreditFeeder:
             # 채널·명령·회계가 동일하므로 feeder 동작은 타입 무관 — 태그는
             # 관측/문서용. ★NPU 는 공간 축(s) 없음: PE 는 배타 단위(Exp_36)라
             # NPU 테넌트 분해는 시간 축 단독 — decide_pair 의 s 개념 미적용.
+            # [Exp_141 1부] 계약값을 적용값과 별개 자리에 보관한다. 계약값을
+            #   바꿀 수 있는 것은 등록·재등록뿐 — ④·적응형·재분배는 ratio(적용값)만
+            #   건드린다. 재기동 복원(Exp_140 RestoreAllocations)도 이 경로로
+            #   들어오므로(units→ratioOf 재산정) 복원 시 계약값이 올바로 선다.
             self._tenants[name] = {"sock": sock_path, "log": log_path,
-                                   "ratio": float(time_ratio), "armed": False,
+                                   "ratio": float(time_ratio),
+                                   "contract": float(time_ratio),
+                                   "armed": False,
                                    "resource": str(resource)}
+            # 재등록 = 계약 변경. 낡은 임대(이전 계약 스냅샷)를 남기면 만료 시
+            #   새 계약이 아니라 옛 값으로 되돌린다 — devID 재사용 오염(Exp_110
+            #   계열)과 같은 함정이라 여기서 지운다.
+            self._ratio_lease.pop(name, None)
 
     def _ctl_forget(self, name):
         """[Exp_135] devID 재사용 오염 방지 — 해제 시 판정 상태를 지운다."""
@@ -266,6 +307,9 @@ class TimeCreditFeeder:
             self._last_sample.pop(name, None)
             self._redist_forget(name)
             self._ctl_forget(name)
+            # [Exp_141 1부] 임대도 함께 소거 — 남기면 같은 devID 를 받은 다음
+            #   파드의 몫이 이전 회차의 계약값으로 되돌아간다(재사용 오염).
+            self._ratio_lease.pop(name, None)
 
     def arm(self, name):
         """게이트 무장 (Exp_16: time_mode 1 + time_credit 0)."""
@@ -285,14 +329,76 @@ class TimeCreditFeeder:
             self._send(t["sock"], "time_credit -1")
 
     # ---- 목표 변경 (Exp_20 재설정 경로) ----
-    def set_ratios(self, ratios, reason=""):
-        """time_ratio 목표 런타임 변경 — 다음 tick 부터 반영."""
+    def set_ratios(self, ratios, reason="", lease_s=None):
+        """time_ratio(적용값) 런타임 변경 — 다음 tick 부터 반영.
+
+        [Exp_138 3-D → Exp_141 2부] 모든 재설정에 만료가 붙는다. 갱신이 끊기면
+        feeder 가 스스로 **계약값(등록 시점 몫, t["contract"])** 으로 되돌린다.
+        갱신은 같은 값으로 다시 부르면 된다(만료가 밀린다).
+
+          lease_s=None  → 기본 만료 RATIO_LEASE_DEFAULT_S (Exp_141: 무기한 고착
+                          경로 제거 — slice_loop 등 lease 미인지 호출자 방어)
+          lease_s>0     → 그 값 (④ closed_loop 등 명시 호출자)
+          lease_s<=0    → 무기한 opt-out — 계약 재정규화(NPU 정책 B)처럼 재설정
+                          자체가 새 계약인 경우만. 이력에 명시돼 남는다
+        """
+        now = time.time()
         with self._lock:
             for name, r in ratios.items():
-                if name in self._tenants:
-                    self._tenants[name]["ratio"] = float(r)
-            self._history.append({"t": round(time.time(), 3),
-                                  "ratios": dict(ratios), "reason": reason})
+                if name not in self._tenants:
+                    continue
+                if lease_s is not None and float(lease_s) <= 0:
+                    # 명시 opt-out — 임대 없음. 기존 임대가 있으면 걷어낸다
+                    # (opt-out 재설정이 새 기준이므로 옛 만료가 덮치면 안 된다).
+                    self._ratio_lease.pop(name, None)
+                else:
+                    ttl = float(lease_s) if lease_s else RATIO_LEASE_DEFAULT_S
+                    self._ratio_lease[name] = {
+                        "expire": now + ttl, "reason": reason}
+                self._tenants[name]["ratio"] = float(r)
+            self._history.append({"t": round(now, 3),
+                                  "ratios": dict(ratios), "reason": reason,
+                                  "lease_s": lease_s})
+
+    def release_ratio_lease(self, names=None):
+        """임대 해제 — 계약값으로 즉시 복귀. 정상 종료 경로에서 부른다."""
+        return self._expire_leases(force=names)
+
+    def _expire_leases(self, force=None):
+        """만료된(또는 force 로 지정된) 임대를 계약값으로 되돌린다.
+
+        [Exp_141 1부] 복귀 목적지는 임대 시점 스냅샷이 아니라 **현재 계약값
+        t["contract"]** — 재등록으로 계약이 바뀌었어도 항상 최신 계약으로 간다.
+        복귀는 즉시·전량이다(단계적 복귀 없음 — 계약이기 때문).
+        """
+        now = time.time()
+        restored = []
+        with self._lock:
+            for name in list(self._ratio_lease):
+                lz = self._ratio_lease[name]
+                due = (force is not None and (force is True or name in force)) or \
+                      (lz.get("expire") is not None and now >= lz["expire"])
+                if not due:
+                    continue
+                t = self._tenants.get(name)
+                if t is not None:
+                    was = t["ratio"]
+                    contract = t.get("contract", lz.get("contract", was))
+                    t["ratio"] = contract
+                    restored.append({"t": round(now, 3), "tenant": name,
+                                     "from": was, "to": contract,
+                                     "reason": lz.get("reason", ""),
+                                     "cause": "force" if force else "expired"})
+                del self._ratio_lease[name]
+            self._lease_restore_total += len(restored)
+        for r in restored:
+            self._lease_restores.append(r)
+            # [T-5] 조용히 되돌리지 않는다 — 계약이 바뀌었다 되돌아온 사실을 남긴다
+            print(f"[feeder][Exp_138] 몫 임대 만료 복귀: {r['tenant']} "
+                  f"{r['from']} → {r['to']} (사유={r['reason']!r} {r['cause']})",
+                  flush=True)
+        del self._lease_restores[:-100]     # [Exp_141] 이력 유계 (카운터는 total 로)
+        return restored
 
     # ── [Exp_107 T-3] weight 변환부 ───────────────────────────────────────
     # 배선과 변환을 분리한다. 고려대와 몫 모델(예약형 vs 비례형)을 협의 중이므로
@@ -476,6 +582,8 @@ class TimeCreditFeeder:
 
     def _run(self):
         while not self._stop.is_set():
+            if self._ratio_lease:
+                self._expire_leases()
             bud = self.budgets()
             for name, b in bud.items():
                 with self._lock:
@@ -588,7 +696,10 @@ class TimeCreditFeeder:
 
     def status(self):
         with self._lock:
+            # [Exp_141 4부] ratio=적용값 · contract=계약값을 나란히 — 고착된
+            #   적용값이 계약처럼 보이던 것(Exp_138 0-B)을 표면에서 가른다.
             tenants = {n: {"ratio": t["ratio"], "armed": t["armed"],
+                           "contract": t.get("contract", t["ratio"]),
                            "sock": t["sock"],
                            "resource": t.get("resource", "gpu")}
                        for n, t in self._tenants.items()}
@@ -596,7 +707,18 @@ class TimeCreditFeeder:
         tot = max(1.0, sum(t["ratio"] for t in tenants.values() if t["armed"]))
         for n, t in tenants.items():
             t["target_share"] = round(t["ratio"] / tot, 4) if t["armed"] else None
+        with self._lock:
+            lease = {n: {"contract": self._tenants.get(n, {}).get("contract"),
+                         "expires_in_s": round(v["expire"] - time.time(), 2)
+                         if v.get("expire") else None,
+                         "reason": v.get("reason", "")}
+                     for n, v in self._ratio_lease.items()}
+            restores = list(self._lease_restores[-10:])
+            restore_total = self._lease_restore_total
         return {"tick_ms": TICK_S * 1000, "env_scale": self._env_scale,
+                "ratio_lease": lease, "lease_restores": restores,
+                "lease_restore_total": restore_total,
+                "lease_default_s": RATIO_LEASE_DEFAULT_S,
                 "env_policy": self._env_policy,
                 "tenants": tenants, "recent_resets": hist,
                 # [Exp_121] 재분배 관측 — 무엇을 누구에게 얼마나 줬는지(1-D)

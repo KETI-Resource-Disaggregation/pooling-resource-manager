@@ -1,0 +1,36 @@
+# [Exp_137] MutatingWebhookConfiguration — clientConfig 를 URL 에서 Service 로 전환.
+#   호스트 프로세스(https://<노드IP>:8443)가 아니라 클러스터 안 Service 를 가리킨다.
+#   노드 IP 가 바뀌어도, 파드가 옮겨 떠도 따라간다.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: kraken-env-webhook
+webhooks:
+  - name: env-collision.kraken.keti.re.kr
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    # ★Fail 로 두지 않는다 — 232 는 엣지 과제와 공유하는 단일 control-plane 이다.
+    #   Ignore 의 결점(조용히 뚫림)은 제어 적용 탐지(KRAKEN_CTLCHECK)가 받는다.
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    # ★순환 의존 차단 — webhook 자신이 사는 kube-system 을 제외한다.
+    #   라벨 in 방식이 아니라 out 방식인 이유: 라벨을 안 붙인 네임스페이스가
+    #   조용히 빠지는 것은 제어 주입에 정반대다(Exp_135).
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, kube-public, kube-node-lease]
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        scope: Namespaced
+    clientConfig:
+      service:
+        name: kraken-webhook
+        namespace: kube-system
+        path: /mutate
+        port: 443
+      caBundle: <BASE64_CA_BUNDLE>   # tools/webhook_cert.sh 가 채운다

@@ -15,7 +15,49 @@
 
 on/off = 이 데몬 기동/종료(롤백). 라이브 광고·플러그인 무수정.
 """
-import argparse, glob, json, os, time, urllib.request
+import argparse, glob, json, os, signal, threading, time, urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# [Exp_141 5-B 실측 결함 수정] SIGTERM 에 finally 를 태운다.
+#   파이썬 기본 SIGTERM 은 인터프리터를 그대로 종료해 finally(원복: ratios_release
+#   + release)가 **실행되지 않는다** — kubectl delete·systemd stop 의 표준 종료
+#   신호가 전부 만료 대기(기본 3s) 경로로 빠진다(실측: SIGTERM 복귀 2.64s =
+#   만료와 동일). SystemExit 로 바꿔 finally 를 타면 즉시 복귀한다.
+def _on_sigterm(_sig, _frame):
+    raise SystemExit(143)
+
+
+signal.signal(signal.SIGTERM, _on_sigterm)
+
+# [Exp_138 3-D] /healthz 상태 — Running 이 동작을 뜻하지는 않는다(Exp_137 교훈).
+#   감시 대상 수·개입 횟수·현재 단계를 노출해 "떠 있는데 아무것도 안 한다"를 구분한다.
+_HEALTH = {"started_at": None, "watched": 0, "interventions": 0, "level": 0,
+           "last_tick_age_s": None, "agg": None, "vic": None, "base_p95_ms": None,
+           "lease_s": None, "handed_off": False}
+_LAST_TICK = [0.0]
+
+
+def _serve_health(port):
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.split("?")[0] != "/healthz":
+                self.send_response(404); self.end_headers(); return
+            st = dict(_HEALTH)
+            st["last_tick_age_s"] = (round(time.time() - _LAST_TICK[0], 2)
+                                     if _LAST_TICK[0] else None)
+            b = json.dumps(st, ensure_ascii=False).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b)
+
+        def log_message(self, *a):
+            pass
+    try:
+        HTTPServer(("0.0.0.0", port), H).serve_forever()
+    except Exception as e:
+        print(f"[loop][경고] /healthz 기동 실패 port={port} err={e!r} — "
+              f"제어는 계속하되 상태 조회가 불가하다", flush=True)
 
 
 _EV_WARNED = False
@@ -160,10 +202,16 @@ def main():
     ap.add_argument("--min-dwell", type=float, default=1.0)     # 상태 전환 후 최소 체류(s)
     ap.add_argument("--steps", default="1.0,0.7,0.5,0.4")       # ratio 사다리(0=NONE/release)
     ap.add_argument("--stale", type=float, default=3.0)
+    ap.add_argument("--ratio-lease-s", type=float, default=3.0,
+                    help="[Exp_138 3-D] 몫 재설정 임대 수명(s). 갱신이 끊기면 "
+                         "feeder 가 계약값으로 되돌린다. 기본값은 --stale 과 같다 — "
+                         "'3초 넘게 소식이 없으면 믿지 않는다'를 양쪽이 같은 값으로 쓴다.")
     ap.add_argument("--safe-level", type=int, default=1)        # 관측 부재 시 보수 단계
     ap.add_argument("--log", default=os.environ.get("KRAKEN_LOOP_LOG", "/tmp/kraken_closed_loop.log"))
     ap.add_argument("--tag", default="")
     ap.add_argument("--emit-events", action="store_true")
+    ap.add_argument("--health-port", type=int, default=0,
+                    help="[Exp_138 3-D] >0 이면 /healthz 를 그 포트에 연다")
     ap.add_argument("--duration", type=float, default=0, help=">0 이면 그 초 뒤 자동 종료")
     a = ap.parse_args()
 
@@ -187,6 +235,12 @@ def main():
         lg.write(line + "\n"); lg.flush()
         print("[loop] " + line, flush=True)
 
+    if a.health_port:
+        _HEALTH["started_at"] = round(time.time(), 3)
+        _HEALTH["lease_s"] = a.ratio_lease_s
+        threading.Thread(target=_serve_health, args=(a.health_port,),
+                         daemon=True).start()
+        print(f"[loop] /healthz :{a.health_port}", flush=True)
     log(f"# START tag={a.tag} base_p95={base}ms k_int={a.k_intervene} k_rel={a.k_release} "
         f"hold={a.release_hold} steps={steps} sync={a.sync_dir}")
 
@@ -323,11 +377,25 @@ def main():
 
     def actuate(lvl, agg_tenant, reason):
         if lvl == 0:
+            # [Exp_138 3-D] NONE 으로 돌아갈 때 임대도 반드시 푼다 —
+            #   release 만으로는 내려간 ratio 가 남는다.
+            _post(f"{a.feeder_url}/feeder/ratios_release", {"tenants": [agg_tenant]})
             _post(f"{a.feeder_url}/feeder/release", {"tenant": agg_tenant})
         else:
             _post(f"{a.feeder_url}/feeder/arm", {"tenant": agg_tenant})
             _post(f"{a.feeder_url}/feeder/ratios",
-                  {"ratios": {agg_tenant: steps[lvl]}, "reason": reason})
+                  {"ratios": {agg_tenant: steps[lvl]}, "reason": reason,
+                   "lease_s": a.ratio_lease_s})
+
+    def renew_lease(lvl, agg_tenant):
+        """[Exp_138 3-D] 임대 갱신 — 개입 중에는 매 틱 만료를 민다.
+        ★이것이 없으면 lease 가 만료돼 개입이 저절로 풀린다. 반대로 이 갱신이
+          끊기면(프로세스 사망) feeder 가 스스로 계약값으로 되돌린다 = 의도한 동작."""
+        if lvl <= 0:
+            return
+        _post(f"{a.feeder_url}/feeder/ratios",
+              {"ratios": {agg_tenant: steps[lvl]}, "reason": "lease-renew",
+               "lease_s": a.ratio_lease_s})
 
     try:
         while True:
@@ -448,6 +516,12 @@ def main():
 
             # [Exp_118 B] 상위로 넘긴 뒤에는 시간 축을 건드리지 않는다(현 위치 동결).
             if handed_off[0]:
+                # [Exp_141 3부] ★동결도 임대 갱신은 계속한다. 이 갱신이 없으면
+                #   동결 3초(기본 임대) 뒤 feeder 만료가 계약값으로 되돌려 —
+                #   살아 있는 ④의 의도된 동결이 저절로 풀렸다(0부 실확인 결함).
+                #   갱신을 여기서 이어가면: 산 ④의 동결 = 유지, ④ 사망 = 만료
+                #   복귀 — "동결은 만료 예외" 같은 구분 불가능한 특례가 필요 없다.
+                renew_lease(level, last_agg)
                 log(f"{now:.2f}", f"{p95:.1f}", f"{r:.2f}", level, steps[level],
                     transitions, "FROZEN(handed-off)",
                     (f"sym={sym:.3f}/abs={sym_abs:.3f}" if sym and sym_abs else "sym=NA"))
@@ -513,11 +587,19 @@ def main():
             else:
                 below_since = None  # 중간 구간 = 유지(진동 방지 데드밴드)
 
+            renew_lease(level, last_agg)   # [Exp_138 3-D] 개입 중 임대 갱신
+            _LAST_TICK[0] = now
+            _HEALTH.update(watched=len(glob.glob(os.path.join(a.sync_dir, "obs_*.json"))),
+                           interventions=transitions, level=level,
+                           agg=last_agg, vic=(vic or {}).get("name"),
+                           base_p95_ms=round(base, 1) if base else None,
+                           handed_off=handed_off[0])
             log(f"{now:.2f}", f"{p95:.1f}", f"{r:.2f}", level, steps[level], transitions, act,
                 (f"sym={sym:.3f}/abs={sym_abs:.3f}" if sym and sym_abs else "sym=NA"))
     finally:
         # 종료 시 aggressor 원복(release) — 다음 실험 오염 방지
         if last_agg:
+            _post(f"{a.feeder_url}/feeder/ratios_release", {"tenants": [last_agg]})
             _post(f"{a.feeder_url}/feeder/release", {"tenant": last_agg})
         log(f"# END transitions={transitions}")
         lg.close()

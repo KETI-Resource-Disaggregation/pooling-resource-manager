@@ -63,6 +63,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_text(self, text: str, status: int = 200,
+                   ctype: str = "text/plain; version=0.0.4; charset=utf-8"):
+        # [Exp_140 2부] Prometheus text exposition 용
+        body = text.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(length)) if length else {}
@@ -93,6 +103,10 @@ class Handler(BaseHTTPRequestHandler):
             # [Exp_82] A-2 규격: 가용 용량 조회. shim(:8091) 흡수 — 팟 내 catalog(factor)
             # + physical(shm) + feeder(slices) 조합. K8s allocatable 대신 factor로 광고 산출.
             self._send_json(_capacity_response())
+        elif self.path.split("?")[0].rstrip("/") == "/metrics":
+            # [Exp_140 2부] A-4·v1.3 38장 실서빙 — /capacity 와 같은 소스.
+            # Exp_139까지 이 경로는 404 였고 kraken_* 는 미가동 스텁 전용이었다.
+            self._send_text(_metrics_response())
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -215,7 +229,9 @@ def _node_name():
     KRAKEN_NODE 미설정 시 개발 노드명으로 폴백한다 — 다른 노드에 배포하면
     /capacity 가 잘못된 노드를 가리키는데 아무 신호가 없다(Exp_103 E-3 하드코딩 10건).
     """
-    v = os.environ.get("KRAKEN_NODE")
+    # [Exp_140] KRAKEN_NODE_NAME(fieldRef, Exp_138 2-B 5)도 본다 — DS 가 이미
+    # 넣어주는 값이라 폴백 경고 없이 어느 노드서든 맞는 이름이 나온다.
+    v = os.environ.get("KRAKEN_NODE") or os.environ.get("KRAKEN_NODE_NAME")
     if v:
         return v
     global _NODE_WARNED
@@ -260,10 +276,22 @@ def _capacity_response():
         tenants = {}
     allocated = sum(round(v.get("ratio", 0) * phys_lsu) for v in tenants.values())
     ratio = round(allocated / phys_lsu, 3) if phys_lsu else 0.0
-    slices = [{"tenant": k, "compute_pct": round(v.get("ratio", 0) * 100, 1),
-               "time_ratio": round(v.get("ratio", 0), 3), "armed": v.get("armed", False)}
-              for k, v in tenants.items()]
     shm = _shm
+    mem_cap_mb = getattr(shm, "physical_mem_mb", 97887)
+    # [Exp_140 2-B] mem_mb — Allocate 의 sliceSpec() 과 같은 식으로 파생:
+    #   virtualMemMB = MemoryMB × units ÷ advertised (정수 나눗셈, plugin.go:253).
+    #   units = round(ratio × physical). 실주입값(BLESS_MEM_QUOTA_MB)과 같은 산식.
+    # [Exp_141 4부] time_ratio=적용값(기존 의미 유지) 옆에 contract_time_ratio=
+    #   계약값(등록 시점 몫). ④·적응형이 내린 값과 계약을 구분해 내보낸다 —
+    #   고착값이 계약처럼 고려대·오케스트로에 나가던 것(Exp_138 0-B)의 노출 분리.
+    #   36장 규격 갱신 제안 대상(신설 필드).
+    slices = [{"tenant": k, "compute_pct": round(v.get("ratio", 0) * 100, 1),
+               "time_ratio": round(v.get("ratio", 0), 3),
+               "contract_time_ratio": round(v.get("contract", v.get("ratio", 0)), 3),
+               "mem_mb": (int(mem_cap_mb * round(v.get("ratio", 0) * phys_lsu)
+                              // adv_lsu) if adv_lsu else 0),
+               "armed": v.get("armed", False)}
+              for k, v in tenants.items()]
     return {
         "schema_version": "1.0", "node": _node_name(),
         "devices": [{
@@ -283,6 +311,161 @@ def _capacity_response():
                 "request_rule": {"allowed_blocks": [1, 2, 4, 8], "alignment": "power_of_two_contiguous"},
                 "lsu_measured": False},
     }
+
+
+# ── [Exp_140 2부] /metrics — Prometheus text exposition ──────────────────────
+# 이름·라벨은 A-4(docs/interface/A4_orchestro_metrics_events.md)·v1.3 38장·
+# 스텁(integration_demo/orchestro_stub/kraken_exporter.py)을 승계한다. 새로 짓지 않는다.
+#
+# 내보내지 않는 것 (T-5: 없는 값을 0 으로 채우지 않는다):
+#   - kraken_slice_retention_ratio — ④(closed_loop) 미가동 시 값이 없다. ④는 독립
+#     CLI 라 controller 로 값이 오지 않는다(배선 자체가 없음). 부재로 둔다.
+#   - kraken_remote_* — RemotePool CR 이 없거나 조회 실패면 부재로 둔다.
+#   - slice 의 pod·class 라벨 — watcher 선기록(podref/class)이 없으면 그 라벨을
+#     뺀다(빈 문자열 금지).
+_REMOTE_WARNED = False
+
+
+def _prom_escape(v):
+    return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _slice_extra(tenant_id):
+    """<sockDir>/<devID>/{class,podref} — watcher 선기록(Exp_110 R-1·Exp_126 4-B).
+
+    controller 는 파드명을 모른다(feeder 는 devID 만 앎). watcher 가 hostPath 에
+    남긴 podref("<ns>/<name>/<container>")를 읽어 pod 라벨을 채운다. 없으면 뺀다.
+    """
+    base = os.environ.get("KRAKEN_BLESS_SOCK_DIR", "/var/lib/kraken/socks")
+    cls, pod = "", ""
+    try:
+        c = open(os.path.join(base, tenant_id, "class")).read().strip()
+        if c in ("compute", "memory"):
+            cls = c
+    except Exception:
+        pass
+    try:
+        parts = open(os.path.join(base, tenant_id, "podref")).read().strip().split("/")
+        if len(parts) == 3:
+            pod = parts[1]
+    except Exception:
+        pass
+    return cls, pod
+
+
+def _remote_pools():
+    """RemotePool CR 목록 — SA 토큰으로 API 직독(스텁의 kubectl 대체, RBAC Exp_140).
+    실패·부재 시 None — 호출자는 kraken_remote_* 를 내보내지 않는다."""
+    import ssl
+    import urllib.request
+    sa = "/var/run/secrets/kubernetes.io/serviceaccount"
+    host = os.environ.get("KUBERNETES_SERVICE_HOST", "")
+    if not host:
+        return None
+    try:
+        tok = open(os.path.join(sa, "token")).read().strip()
+        ctx = ssl.create_default_context(cafile=os.path.join(sa, "ca.crt"))
+        url = "https://%s:%s/apis/keti.re.kr/v1alpha1/remotepools" % (
+            host, os.environ.get("KUBERNETES_SERVICE_PORT", "443"))
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
+        with urllib.request.urlopen(req, timeout=3, context=ctx) as r:
+            return json.load(r).get("items", [])
+    except Exception as e:
+        global _REMOTE_WARNED
+        if not _REMOTE_WARNED:
+            _REMOTE_WARNED = True
+            print(f"[controller][경고] RemotePool 조회 실패 err={e!r} — "
+                  f"kraken_remote_* 계열은 내보내지 않는다(0 아님, 부재). "
+                  f"RBAC(remotepools get/list)·CRD 존재를 확인하라.", flush=True)
+        return None
+
+
+def _metrics_response():
+    cap = _capacity_response()
+    d = cap["devices"][0]
+    c = d["capacity"]
+    node = _prom_escape(cap["node"])
+    L = 'node="%s",device="%s",location="local"' % (node, _prom_escape(d["uuid"]))
+    ratio = c["allocation_ratio"]
+    hint = d["interference_hint"]
+    # zone 판정 주체 = 이 exporter. 임계는 /capacity interference_hint 와 동일 상수
+    # (Exp_80: <1.00 무간섭 / 1.00~1.40 전이 / >=1.40 간섭). 스텁 render() 승계.
+    zone = 2 if ratio >= hint["interference_above"] else (
+        1 if ratio >= hint["no_interference_below"] else 0)
+
+    out = []
+
+    def fam(name, help_, series):
+        if not series:
+            return                      # 계열 자체가 비면 HELP/TYPE 도 내지 않는다
+        out.append("# HELP %s %s" % (name, help_))
+        out.append("# TYPE %s gauge" % name)
+        out.extend(series)
+
+    fam("kraken_node_physical_lsu", "물리 논리 용량(실측 LSU)",
+        ["kraken_node_physical_lsu{%s} %s" % (L, c["physical_lsu"])])
+    adv_series = ["kraken_node_advertised_lsu{%s} %s" % (L, c["advertised_lsu"])]
+    fam("kraken_node_overcommit_factor", "오버커밋 배율(catalog overcommit_factor)",
+        ["kraken_node_overcommit_factor{%s} %s" % (L, c["overcommit_factor"])])
+    fam("kraken_node_allocation_ratio", "총 할당률(=Σpct, 간섭 축)",
+        ["kraken_node_allocation_ratio{%s} %s" % (L, ratio)])
+    fam("kraken_node_interference_zone",
+        "0=무간섭(<100%) 1=전이 2=간섭(>=140%) — 임계는 interference_hint(Exp_80) 동일",
+        ["kraken_node_interference_zone{%s} %s" % (L, zone)])
+    fam("kraken_node_npu_cores_available", "NPU 가용 코어(/capacity npu 와 동일 소스)",
+        ['kraken_node_npu_cores_available{node="%s"} %s'
+         % (node, cap["npu"]["available_cores"])])
+
+    pct_s, mem_s, tr_s, ctr_s, armed_s, mode_s = [], [], [], [], [], []
+    for s in d.get("slices", []):
+        cls, pod = _slice_extra(s["tenant"])
+        SL = L + ',tenant="%s"' % _prom_escape(s["tenant"])
+        if pod:
+            SL += ',pod="%s"' % _prom_escape(pod)
+        if cls:
+            SL += ',class="%s"' % cls
+        pct_s.append("kraken_slice_compute_pct{%s} %s" % (SL, s["compute_pct"]))
+        mem_s.append("kraken_slice_mem_mb{%s} %s" % (SL, s["mem_mb"]))
+        tr_s.append("kraken_slice_time_ratio{%s} %s" % (SL, s["time_ratio"]))
+        # [Exp_141 4부] 계약값 — time_ratio(적용값)의 기존 의미는 그대로 두고
+        # 새 계열로 분리(38장 갱신 제안). 이름은 kraken_slice_* 규칙 승계.
+        if "contract_time_ratio" in s:
+            ctr_s.append("kraken_slice_contract_time_ratio{%s} %s"
+                         % (SL, s["contract_time_ratio"]))
+        armed_s.append("kraken_slice_armed{%s} %s" % (SL, 1 if s["armed"] else 0))
+        # mode 값 = feeder 의 슬라이스 실상태(armed/released). 38장의 relaxed|strict|off
+        # 는 슬라이스 단위 실체가 없어 쓰지 않는다(지시서 2-C·report §4 — 38장 갱신 제안).
+        mode_s.append('kraken_slice_control_mode{%s,mode="%s"} 1'
+                      % (SL, "armed" if s["armed"] else "released"))
+    fam("kraken_slice_compute_pct", "슬라이스 연산 몫(%)", pct_s)
+    fam("kraken_slice_mem_mb", "슬라이스 메모리 쿼터(MB, sliceSpec 동일 산식)", mem_s)
+    fam("kraken_slice_time_ratio", "슬라이스 시간 몫 — 현재 적용값", tr_s)
+    fam("kraken_slice_contract_time_ratio",
+        "슬라이스 시간 몫 — 계약값(등록 시점, Exp_141)", ctr_s)
+    fam("kraken_slice_armed", "1=제어 걸림(armed) 0=풀림(released)", armed_s)
+    fam("kraken_slice_control_mode", "슬라이스 제어 상태(mode=armed|released)", mode_s)
+
+    pools = _remote_pools()
+    leased_s, phase_s = [], []
+    if pools:
+        for p in pools:
+            dev = p.get("spec", {}).get("device", {})
+            st = p.get("status", {})
+            RL = ('node="%s",device="%s",location="remote",provider="%s"'
+                  % (node, _prom_escape(dev.get("uuid", "")),
+                     _prom_escape(p.get("spec", {}).get("providerHost", ""))))
+            adv_series.append("kraken_node_advertised_lsu{%s} %s"
+                              % (RL, st.get("advertisedLsu", 0)))
+            leased_s.append("kraken_remote_leased_lsu{%s} %s"
+                            % (RL, st.get("leasedLsu", 0)))
+            if st.get("phase"):
+                phase_s.append('kraken_remote_pool_phase{%s,phase="%s"} 1'
+                               % (RL, _prom_escape(st["phase"])))
+    fam("kraken_node_advertised_lsu", "스케줄링에 노출한 LSU(local/remote)", adv_series)
+    fam("kraken_remote_leased_lsu", "원격 풀 lease 중 LSU", leased_s)
+    fam("kraken_remote_pool_phase", "RemotePool phase(라벨 phase, 값 1)", phase_s)
+
+    return "\n".join(out) + "\n"
 
 
 # ── 백그라운드 루프 ───────────────────────────────────────────────────────────

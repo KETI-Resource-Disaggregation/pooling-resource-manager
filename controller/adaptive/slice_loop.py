@@ -173,6 +173,14 @@ def main():
 
             need = UP_HOLD if direction > 0 else DOWN_HOLD
             if direction == 0 or cnt < need:
+                # [Exp_141 2부] 조절 유지 중에도 임대를 갱신한다. feeder 의 기본
+                #   만료(RATIO_LEASE_DEFAULT_S)가 생겨, 변경 시에만 보내던 구
+                #   동작으로는 안정 유지 구간에서 갱신이 끊겨 3초마다 계약값으로
+                #   튕긴다. 계약 그대로(mult==1.0)면 보낼 것이 없다.
+                if not a.dry_run and abs(cur_mult[name] - 1.0) > 1e-9:
+                    _post(f"{a.feeder_url}/feeder/ratios",
+                          {"ratios": {name: round(base_ratio[name] * cur_mult[name], 4)},
+                           "reason": "adaptive-renew"})
                 continue
 
             new_mult = cur_mult[name] + STEP * direction

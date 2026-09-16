@@ -10,7 +10,13 @@ transition→ratios 매핑; adaptive_map lookup 은 감사 기록용으로 첨�
   POST /feeder/register          {tenant, sock, log, time_ratio}
   POST /feeder/arm|release       {tenant}
   POST /feeder/deregister        {tenant}           [Exp_53] watcher 자동 정리
-  POST /feeder/ratios            {ratios:{...}, reason}
+  POST /feeder/ratios            {ratios:{...}, reason, lease_s?}  [Exp_138 3-D·141]
+                                  lease_s 미지정=기본 임대(만료 시 계약 복귀),
+                                  >0=그 값, <=0=무기한 opt-out
+  POST /feeder/ratios_release    {tenants:true|[...]}  [Exp_138 3-D] 임대 즉시 해제
+  POST /feeder/mode_event        {reason_kind?, tenant, mode, reason, class,
+                                  pod?, pod_ns?, pod_uid?}  [Exp_138 2-B 5·140 3부]
+                                  ③ 전환·Slice 이벤트 발행 (K8s Event)
   POST /feeder/env_policy        {policy, reason}   [Exp_40] strict|relaxed_hetero|capped_hetero
   GET  /lifecycle/state          상태머신 현재 상태 + 감사 로그
   GET  /lifecycle/ledger         residual 장부 view + 감사 로그
@@ -157,8 +163,51 @@ def handle_post(h, path, body):
             _feeder.deregister(body["tenant"])
             h._send_json({"ok": True})
         elif path == "/feeder/ratios":
-            _feeder.set_ratios(body["ratios"], reason=body.get("reason", ""))
+            # [Exp_138 3-D] lease_s 를 주면 그 시간 뒤 계약값으로 자동 복귀한다.
+            #   주지 않으면 구 동작(무기한) — 기존 호출자 무영향.
+            _feeder.set_ratios(body["ratios"], reason=body.get("reason", ""),
+                               lease_s=body.get("lease_s"))
             h._send_json({"ok": True})
+        elif path == "/feeder/ratios_release":     # [Exp_138 3-D] 임대 즉시 해제
+            h._send_json({"ok": True,
+                          "restored": _feeder.release_ratio_lease(
+                              body.get("tenants", True))})
+        elif path == "/feeder/mode_event":         # [Exp_138 2-B 5] ③ 전환 이벤트
+            # Go 와이어러가 모드를 바꿀 때마다 사유와 함께 부른다. 발행 실패는
+            # 제어를 막지 않으나 조용히 넘기지 않는다(T-5) — 사유를 응답에 싣는다.
+            # [Exp_140 3부] reason 확장 — 새 발행 경로를 만들지 않고 이 경로에
+            #   SliceCreated/SliceDestroyed 를 더한다(지시서 3-A). reason 은
+            #   화이트리스트로 제한한다(임의 reason 주입 방지).
+            from scanner.mode_event import emit as _emit_mode
+            _ALLOWED = ("ControlModeSwitched", "SliceCreated", "SliceDestroyed")
+            _reason = body.get("reason_kind", "ControlModeSwitched")
+            if _reason not in _ALLOWED:
+                h._send_json({"ok": False,
+                              "error": f"reason {_reason!r} not in {_ALLOWED}"}, 400)
+                return
+            _t = body.get("tenant", "")
+            _pod = body.get("pod", "")
+            _pod_ns = body.get("pod_ns", "")
+            if _reason == "ControlModeSwitched":
+                _msg = (f"tenant={_t} mode={body.get('mode','')} "
+                        f"reason={body.get('reason','')} class={body.get('class','')}")
+                _name = ""            # 전환은 반복 사건 — generateName 유지
+            else:
+                _msg = (f"tenant={_t} pod={_pod_ns}/{_pod} "
+                        f"{body.get('detail','')}").strip()
+                # 결정적 이름 = 파드 UID 기준 멱등 (재시도·재조정·재기동 중복 방지)
+                _uid = body.get("pod_uid", "")
+                _suffix = _uid if _uid else _t
+                _name = ("kraken-slice-created-" if _reason == "SliceCreated"
+                         else "kraken-slice-destroyed-") + _suffix.lower()
+            try:
+                _r = _emit_mode(_reason, _msg, tenant=_t,
+                                pod=_pod, pod_ns=_pod_ns, event_name=_name)
+                h._send_json({"ok": True, "dup": _r == "dup"})
+            except Exception as _e:
+                print(f"[loop_api][경고] {_reason} 발행 실패: {_e!r} "
+                      f"({_msg})", flush=True)
+                h._send_json({"ok": False, "error": str(_e)})
         elif path == "/feeder/env_policy":         # [Exp_40] 봉투 정책 opt-in
             _feeder.set_env_policy(body["policy"],
                                    reason=body.get("reason", ""))
@@ -231,8 +280,12 @@ def _start_swap(body):
 
     def gate_on():
         if gate.get("ratios"):
+            # [Exp_141] lease_s=0 = 무기한 opt-out 명시. swap 게이트는 전환 창
+            #   동안 유지돼야 하는데 창 길이(standby 기동 대기)가 기본 임대 3s 를
+            #   넘을 수 있다. gate_off/deregister 가 정리 경로다.
             _feeder.set_ratios(gate["ratios"],
-                               reason=gate.get("reason", "swap gate_on"))
+                               reason=gate.get("reason", "swap gate_on"),
+                               lease_s=0)
         for t in gate.get("ratios", {}):
             _feeder.arm(t)
 

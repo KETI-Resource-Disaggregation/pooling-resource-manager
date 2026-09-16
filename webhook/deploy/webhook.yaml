@@ -1,0 +1,72 @@
+# [Exp_137] webhook 상주 배치 — 호스트 nohup 프로세스를 대체한다.
+#
+# ★배치 형태 = Deployment (DaemonSet 아님).
+#   webhook 은 노드에 종속되지 않는다. 장치도 hostPath 도 쓰지 않고 API 서버가
+#   Service 로 호출한다. DaemonSet 은 "노드마다 하나"가 필요할 때 쓰는 것이라 맞지 않는다.
+#   ★replicas=2 + maxUnavailable=0 : 파드 교체 중 구멍을 없앤다. 단일 노드라 노드 장애에는
+#   무의미하지만, 이 구성이 막는 것은 노드 장애가 아니라 **롤링 업데이트·재시작 구간**이다.
+#   failurePolicy=Ignore 이므로 그 구간에 뜨는 파드는 패치 없이 통과한다(조용히).
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: kraken-webhook, namespace: kube-system}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kraken-webhook
+  namespace: kube-system
+  labels: {app: kraken-webhook}
+spec:
+  selector: {app: kraken-webhook}
+  ports:
+    - {name: https, port: 443, targetPort: 8443, protocol: TCP}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kraken-webhook
+  namespace: kube-system
+  labels: {app: kraken-webhook}
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels: {app: kraken-webhook}
+  template:
+    metadata:
+      labels: {app: kraken-webhook}
+    spec:
+      serviceAccountName: kraken-webhook
+      # ★control-plane 에도 뜰 수 있어야 한다(단일 노드 = control-plane).
+      tolerations:
+        - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      containers:
+        - name: webhook
+          image: kraken-device-plugin:exp137
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-u", "/opt/kraken/webhook/webhook_server.py"]
+          env:
+            - {name: KRAKEN_WH_CERT, value: /etc/kraken-webhook/tls.crt}
+            - {name: KRAKEN_WH_KEY,  value: /etc/kraken-webhook/tls.key}
+            - {name: KRAKEN_WH_PORT, value: "8443"}
+          ports:
+            - {name: https, containerPort: 8443}
+          # ★"Running" 이 "동작한다" 를 뜻하지 않는다 — /healthz 로 실제 응답을 본다.
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8443, scheme: HTTPS}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8443, scheme: HTTPS}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - {name: tls, mountPath: /etc/kraken-webhook, readOnly: true}
+          resources:
+            requests: {cpu: 20m, memory: 64Mi}
+            limits:   {cpu: 200m, memory: 256Mi}
+      volumes:
+        - name: tls
+          secret: {secretName: kraken-webhook-tls}
