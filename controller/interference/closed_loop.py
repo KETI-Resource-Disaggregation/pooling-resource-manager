@@ -115,11 +115,25 @@ def _post(url, body):
         return False
 
 
+_FEEDER_URL = ["http://localhost:8090"]      # main() 이 실제 값으로 채운다
+
+
 def emit_event(reason, msg, warn=False):
-    """K8s Event 발행(오케스트로 A-4). 실패는 무시(측정 방해 금지)."""
+    """K8s Event 발행(오케스트로 A-4). 실패는 무시(측정 방해 금지).
+
+    [Exp_151 1부] ★발행 경로를 컨트롤러 `/feeder/mode_event`(= mode_event.py)로
+    모은다. 기존의 자체 kubectl 경로는 실측상 무결함이었으나(default ns + Node 는
+    허용 조합), 경로가 둘이면 같은 결함을 두 번 고치게 된다 — Exp_150 의 422 가
+    mode_event.py 에만 수정된 것이 그 사례다. 컨트롤러 불가 시 kubectl 폴백(경고).
+    """
+    ok = _post(_FEEDER_URL[0] + "/feeder/mode_event",
+               {"reason_kind": reason, "tenant": "closed-loop", "mode": reason,
+                "reason": msg[:180], "class": "", "warn": warn})
+    if ok:
+        return
     ev = {
         "apiVersion": "v1", "kind": "Event",
-        "metadata": {"generateName": "kraken-loop-"},
+        "metadata": {"generateName": "kraken-loop-", "namespace": "default"},
         "involvedObject": {"kind": "Node", "name": "gpu-npu-server-02"},
         "reason": reason, "message": msg,
         "type": "Warning" if warn else "Normal",
@@ -139,7 +153,20 @@ def emit_event(reason, msg, warn=False):
                   f"이벤트 기록이 남지 않는다.", flush=True)
 
 
-def read_obs(sync_dir, stale_s, base_p95=None):
+def _declared_class(tenant, sock_dir="/var/lib/kraken/socks"):
+    """[Exp_151 4-B] 역할 소스 통일 — ③(Go 와이어러)이 읽는 **선언 class 파일**을
+    같은 자리에서 읽는다(설계 전제 1: 역할 판정은 한 곳, ③④가 같은 값).
+    obs json 의 class 는 하네스 워커가 쓴 사본이라 ③과 어긋날 수 있다 —
+    이제 obs json 은 **응답 시간 신호로만** 쓴다."""
+    if not tenant:
+        return None
+    try:
+        return open(os.path.join(sock_dir, tenant, "class")).read().strip() or None
+    except OSError:
+        return None
+
+
+def read_obs(sync_dir, stale_s, base_p95=None, p95_fallback=False):
     """obs_*.json 을 읽어 victim/aggressor 로 분류. 신선한 것만.
 
     1차 기준은 class 라벨(memory=victim, compute=aggressor)이며 기존 동작이다.
@@ -159,6 +186,7 @@ def read_obs(sync_dir, stale_s, base_p95=None):
     now = time.time()
     vic, agg = None, None
     fresh = []
+    aggs = []
     for p in glob.glob(os.path.join(sync_dir, "obs_*.json")):
         try:
             with open(p) as f:
@@ -168,11 +196,31 @@ def read_obs(sync_dir, stale_s, base_p95=None):
         if now - o.get("ts", 0) > stale_s:
             continue
         fresh.append(o)
-        if o.get("class") == "memory":
+        # [Exp_151 4-B] 역할은 **선언 소스(③과 같은 class 파일)**가 정한다.
+        #   선언이 없으면 obs json 의 class 로 폴백(하네스 하위 호환 — 선언 파일은
+        #   libbless 가 같은 env 로 쓰므로 정상 경로에서는 항상 일치한다).
+        cls = _declared_class(o.get("tenant")) or o.get("class")
+        if cls == "memory":
             vic = o
-        elif o.get("class") == "compute":
+        elif cls == "compute":
             agg = o
+            aggs.append(o)
+    # [Exp_151 4-E] 배치 측이 둘 이상 — 규칙 없던 "마지막 승"을 없앤다.
+    #   근거 있는 규칙이 없으므로 **개입하지 않는다**(지시서: 근거 없는 칸은 부작위).
+    if len(aggs) > 1:
+        _warn_once("multi_agg",
+                   f"배치(compute) 측이 {len(aggs)}개 — 개입 규칙 미확립이라 "
+                   f"개입하지 않는다(이벤트·로그만): "
+                   f"{[x.get('tenant') or x.get('name') for x in aggs]}")
+        _HEALTH["multi_agg"] = len(aggs)
+        return vic, None
+    _HEALTH["multi_agg"] = 0
     if vic is not None and agg is not None:
+        return vic, agg
+    # [Exp_151 4-C] p95 순위 폴백은 **옵션(기본 꺼짐)** — 상주 모드에서 켜지 않는다.
+    #   지켜줄 쪽은 의도(선언)이지 지연 순위가 아니다: prefill 은 스텝당 지연이 원래
+    #   길어 서빙 측으로 오인된다. Exp_142 동종 쌍 개입 진동의 원인 후보(5부 G2 판정).
+    if not p95_fallback:
         return vic, agg
     # 라벨로 쌍이 안 서면 실측 저하율로 대체 판정 (T-5: 조용히 넘어가지 않는다)
     cand = [o for o in fresh if o.get("p95_ms")]
@@ -194,7 +242,10 @@ def main():
     ap.add_argument("--victim-p95-base", type=float, default=None,
                     help="victim solo p95(ms) 기준선 — 유지율·개입 임계 계산의 분모")
     ap.add_argument("--interval", type=float, default=0.5)
-    ap.add_argument("--k-intervene", type=float, default=1.5)   # baseline×이 값 초과 → 조임
+    # [Exp_151 4-D] 기본값 1.5 → 1.7. 유래(T-7): Exp_89 — 첫 시도 1.5가 약한 경합에
+    #   과잉 개입해 1.7로 확정했고, Exp_89·92의 실측(유지율 0.477→0.743)도 전부
+    #   1.7 실행 인자였다(Exp_139 5-C). 코드 기본값만 1.5로 남아 있던 불일치 해소.
+    ap.add_argument("--k-intervene", type=float, default=1.7)   # baseline×이 값 초과 → 조임
     ap.add_argument("--k-release", type=float, default=1.2)     # baseline×이 값 미만 → 풂 후보
     ap.add_argument("--intervene-hold", type=float, default=2.0,
                     help="조이기 전 초과가 지속돼야 하는 시간(s) — 롤링 p95 순간 스파이크 무시")
@@ -210,12 +261,24 @@ def main():
     ap.add_argument("--log", default=os.environ.get("KRAKEN_LOOP_LOG", "/tmp/kraken_closed_loop.log"))
     ap.add_argument("--tag", default="")
     ap.add_argument("--emit-events", action="store_true")
+    ap.add_argument("--p95-fallback", action="store_true",
+                    help="[Exp_151 4-C] 라벨로 쌍이 안 설 때 p95 순위로 대체 판정 — "
+                         "하네스 전용. 상주 모드 기본 꺼짐(지켜줄 쪽은 의도이지 "
+                         "지연 순위가 아니다)")
+    ap.add_argument("--observe-only", action="store_true",
+                    help="[Exp_151 4-I] 관측 전용 — 판정·/healthz·retention 보고는 "
+                         "하되 actuate(arm/release/ratios)를 하지 않는다")
+    ap.add_argument("--report-retention", action="store_true",
+                    help="[Exp_151 4-G] victim 유지율(base/p95)을 컨트롤러 "
+                         "/feeder/retention 으로 보고 — /metrics "
+                         "kraken_slice_retention_ratio 배선")
     ap.add_argument("--health-port", type=int, default=0,
                     help="[Exp_138 3-D] >0 이면 /healthz 를 그 포트에 연다")
     ap.add_argument("--duration", type=float, default=0, help=">0 이면 그 초 뒤 자동 종료")
     a = ap.parse_args()
 
     steps = [float(x) for x in a.steps.split(",")]
+    _FEEDER_URL[0] = a.feeder_url          # [Exp_151] emit_event 가 mode_event 경유로 쓴다
     # [Exp_118 A] ★기준선을 외부에서 받지 않고 **개입 전(level 0) 관측으로 스스로 잡는다.**
     #   외부 주입(--victim-p95-base)은 두 번 사고를 냈다:
     #     Exp_115 3-A — 가짜 단독(89:1)으로 기준선이 2배 부풀어 측정 전체 무효
@@ -251,6 +314,9 @@ def main():
     transitions = 0
     last_agg = None
     t_start = time.time()
+    name_gen = {}            # [Exp_151 3부] obs name → tenant(devID) — 세대 감지
+    nosig_check = [0.0]      # [Exp_151 4-H] 신호 없는 파드 점검 주기 앵커
+    retention_last = [0.0]   # [Exp_151 4-G] 유지율 보고 주기 앵커
 
     # ── [Exp_108 D-3] 단계 승격 ────────────────────────────────────────────
     # ★단계 순서: 계획서는 SM 재조정(공간)을 1단계, 시간 재조정을 2단계로 두었으나
@@ -376,6 +442,11 @@ def main():
         return True
 
     def actuate(lvl, agg_tenant, reason):
+        # [Exp_151 4-I] 관측 전용 — 부작위를 로그로 남긴다(조용한 무동작 금지)
+        if a.observe_only:
+            log(f"{time.time():.2f}", "OBSERVE-ONLY", agg_tenant,
+                f"lvl={lvl}", reason, "(actuate 생략)")
+            return
         if lvl == 0:
             # [Exp_138 3-D] NONE 으로 돌아갈 때 임대도 반드시 푼다 —
             #   release 만으로는 내려간 ratio 가 남는다.
@@ -403,7 +474,69 @@ def main():
             if a.duration and time.time() - t_start > a.duration:
                 break
             now = time.time()
-            vic, agg = read_obs(a.sync_dir, a.stale)
+            vic, agg = read_obs(a.sync_dir, a.stale, p95_fallback=a.p95_fallback)
+
+            # ── [Exp_151 3부] 파드 세대 인식 ──────────────────────────────
+            #   감지 기준 = **obs name → tenant(devID) 매핑의 변화.** 파드가 교체되면
+            #   obs 파일명(name)은 같아도 devID 가 바뀐다(Exp_142 §5 실측: 옛 devID 로
+            #   renew/arm 400 연발). devID 는 ③(class 파일 경로)·회계의 정체성이므로
+            #   같은 기준을 쓴다. 교체 감지 시 **옛 세대의 것을 전부 버린다** —
+            #   기준선(self_base/base)·대칭 판정·사다리 위치·핸드오프. 임대는
+            #   Exp_141 만료가 스스로 걷는다(여기서 옛 devID 로 아무것도 보내지 않는다).
+            gen_reset = False
+            for o in (vic, agg):
+                if not o:
+                    continue
+                nm, tn = o.get("name"), o.get("tenant")
+                if not nm or not tn:
+                    continue
+                # ★세대 = (devID, pid). devID 만으로는 부족하다 — G456 실측에서
+                #   파드 교체 후 kubelet 이 **같은 devID 를 재할당**해 감지가 뚫렸다.
+                #   pid 는 새 컨테이너에서 반드시 바뀐다(worker 가 obs 에 기록).
+                gen = (tn, o.get("pid"))
+                old_gen = name_gen.get(nm)
+                if old_gen is not None and old_gen != gen:
+                    gen_reset = True
+                    log(f"{now:.2f}", "GEN_RESET", nm, f"{old_gen}->{gen}",
+                        "기준선·사다리·대칭 판정 폐기(새 세대)")
+                name_gen[nm] = gen
+            if gen_reset:
+                self_base.clear()
+                base = a.victim_p95_base          # 외부 주입값 외에는 다시 잡는다
+                base_locked[0] = False; base_lock_t[0] = None
+                sym_locked[0] = None; sym_tried[0] = False; sym_p95_at_try[0] = None
+                sym_promoted[0] = False; handed_off[0] = False
+                level = 0; above_since = None; below_since = None
+                last_agg = None                   # 옛 devID 로 요청이 나가지 않게 끊는다
+                _HEALTH["gen_resets"] = _HEALTH.get("gen_resets", 0) + 1
+
+            # [Exp_151 4-H] 신호 없는 파드 노출 — feeder 테넌트 중 obs 가 없는 수.
+            #   이 파드들은 개입 대상이 아니다(조용히 넘기지 않는다).
+            if now - nosig_check[0] >= 5.0:
+                nosig_check[0] = now
+                try:
+                    st = json.load(urllib.request.urlopen(
+                        a.feeder_url + "/feeder/status", timeout=2))
+                    tens = set(st.get("tenants", {}))
+                    # ★신호 유무 = obs 파일의 존재(신선)이지 역할 분류가 아니다 —
+                    #   동종·무선언이라 vic/agg 가 안 서도 신호는 있는 것이다(G2 실측 교정)
+                    seen = set()
+                    for _p in glob.glob(os.path.join(a.sync_dir, "obs_*.json")):
+                        try:
+                            _o = json.load(open(_p))
+                            if now - _o.get("ts", 0) <= a.stale and _o.get("tenant"):
+                                seen.add(_o["tenant"])
+                        except Exception:
+                            pass
+                    nosig = sorted(tens - seen)
+                    _HEALTH["watched"] = len(tens)
+                    _HEALTH["no_signal_pods"] = len(nosig)
+                    if nosig:
+                        _warn_once("nosig-" + ",".join(nosig),
+                                   f"응답 시간 신호 없는 파드 {len(nosig)}개 — 개입 대상 아님: {nosig}")
+                except Exception:
+                    pass
+
             newly = False
             if agg:
                 t = agg.get("tenant")
@@ -445,6 +578,15 @@ def main():
                 time.sleep(a.interval); continue
             r = p95 / base
             act = "hold"
+
+            # [Exp_151 4-G] 유지율 보고 — victim 의 base/p95 를 컨트롤러로.
+            #   신호가 있는 테넌트만 보낸다(없는 것을 0 으로 채우지 않는다).
+            if a.report_retention and now - retention_last[0] >= 1.0:
+                retention_last[0] = now
+                _post(f"{a.feeder_url}/feeder/retention",
+                      {"tenant": vic.get("tenant"), "name": vic.get("name"),
+                       "retention": round(min(base / p95, 1.0), 4) if p95 else None,
+                       "p95_ms": p95, "base_ms": base, "ts": now})
 
             # ── [Exp_116 2부] 대칭 판정 ────────────────────────────────────
             #   양쪽이 비슷하게 아프면 조일 대상이 없다 → 사다리를 끝까지 내리는 동안
@@ -497,8 +639,11 @@ def main():
                         sym_tried[0] = False; sym_p95_at_try[0] = None
                     else:
                         sym_promoted[0] = True
+                        # [Exp_151 5부 실측 결함] sym 이 None 인 틱(관측 한쪽 결손)에
+                        #   이 분기로 들어오면 f-string 포맷이 TypeError 로 ④ 전체를
+                        #   죽였다(G456 loop2 크래시 실측). 상주 프로세스에서 치명적.
                         emit_relocation(last_agg, vic.get("tenant") if vic else None,
-                                        f"symmetric-degradation sym={sym:.3f} "
+                                        f"symmetric-degradation sym={sym if sym is None else round(sym,3)} "
                                         f"one-step-no-improve({(prev-p95)/prev*100:+.1f}%)")
                         handed_off[0] = True      # [Exp_118 B] 시간 축 동결
                         log(f"{now:.2f}", f"{p95:.1f}", f"{r:.2f}", level, steps[level],

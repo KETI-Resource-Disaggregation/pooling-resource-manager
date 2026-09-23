@@ -64,6 +64,11 @@ def emit(reason, message, tenant="", warn=False, namespace="kube-system",
         if not node:
             raise RuntimeError("KRAKEN_NODE_NAME 미설정 — involvedObject 를 만들 수 없다")
         involved = {"kind": "Node", "name": node}
+        # [Exp_150] ★클러스터 스코프 객체(Node)의 Event 는 "default" 네임스페이스에만
+        #   생성된다 — kube-system 에 만들면 involvedObject.namespace("")가 이벤트
+        #   네임스페이스와 불일치해 422. Exp_140 이 RBAC 403 을 잡은 뒤에도
+        #   이 경로는 **한 번도 발행에 성공한 적이 없었다**(라이브 실측 422 전건).
+        namespace = "default"
     meta = {"namespace": namespace}
     if event_name:
         meta["name"] = event_name

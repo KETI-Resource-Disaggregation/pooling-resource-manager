@@ -318,6 +318,10 @@ class TimeCreditFeeder:
             t["armed"] = True
         self._send(t["sock"], "time_mode 1")
         self._send(t["sock"], "time_credit 0")
+        # [Exp_146] 급함 등급의 크레딧 대출 한도 = 충전 1주기분.
+        #   libbless 코드 기본값과 같은 값을 명시로 내려 둘이 어긋나지 않게 한다
+        #   (KRAKEN_CTLCHECK 처럼 코드·배포가 갈리는 상태를 만들지 않는다).
+        self._send(t["sock"], "urgent_limit %d" % int(TICK_S * 1e6))
 
     def release(self, name):
         """게이트 해제 = unlimited (Exp_22 gate_off: time_credit -1)."""

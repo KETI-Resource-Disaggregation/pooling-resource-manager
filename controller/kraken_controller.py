@@ -301,13 +301,19 @@ def _capacity_response():
                          "overcommit_factor": factor, "allocated_lsu": allocated,
                          "allocation_ratio": ratio, "lsu_measured": measured},
             "memory": {"capacity_mb": getattr(shm, "physical_mem_mb", 97887),
-                       "quota_divisor": "advertised_lsu"},
+                       "quota_divisor": "advertised_lsu",
+                       # [Exp_152 1-C] LSU당 메모리(MB) = capacity ÷ advertised.
+                       #   스케줄러가 `모델 VRAM ÷ 이 값`으로 최소 LSU 를 스스로
+                       #   계산한다(소형 요청 하한 — 추정치를 규격에 박지 않고
+                       #   산식 입력을 낸다). 배율이 바뀌면 자동으로 따라간다.
+                       "mb_per_lsu": (round(mem_cap_mb / adv_lsu, 1)
+                                      if adv_lsu else None)},
             "slices": slices,
             "interference_hint": {"current_sigma_pct": ratio, "no_interference_below": 1.00,
                                   "interference_above": 1.40,
                                   "note": "100~140%는 victim 무게 의존 전이(Exp_80). 경량 저지연 victim ~130%까지 안전"},
         }],
-        "npu": {"available_cores": 8,
+        "npu": {"available_cores": _npu_available(),
                 "request_rule": {"allowed_blocks": [1, 2, 4, 8], "alignment": "power_of_two_contiguous"},
                 "lsu_measured": False},
     }
@@ -351,6 +357,38 @@ def _slice_extra(tenant_id):
     except Exception:
         pass
     return cls, pod
+
+
+_NPU_CACHE = {"t": 0.0, "v": None}
+
+
+def _npu_available():
+    """[Exp_152] npu 가용 코어 — 하드코딩 8(Exp_139 지적)을 노드 allocatable
+    (plugin 동적 광고와 같은 소스)로 대체. 조회 실패 시 None — 지어내지 않는다.
+    10s 캐시(플러그인 광고 갱신 주기 대비 충분히 짧고, /capacity 폴링 부하 차단)."""
+    import ssl
+    import urllib.request
+    now = time.time()
+    if now - _NPU_CACHE["t"] < 10:
+        return _NPU_CACHE["v"]
+    sa = "/var/run/secrets/kubernetes.io/serviceaccount"
+    host = os.environ.get("KUBERNETES_SERVICE_HOST", "")
+    v = None
+    if host:
+        try:
+            tok = open(os.path.join(sa, "token")).read().strip()
+            ctx = ssl.create_default_context(cafile=os.path.join(sa, "ca.crt"))
+            url = "https://%s:%s/api/v1/nodes/%s" % (
+                host, os.environ.get("KUBERNETES_SERVICE_PORT", "443"), _node_name())
+            req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
+            with urllib.request.urlopen(req, timeout=3, context=ctx) as r:
+                al = json.load(r).get("status", {}).get("allocatable", {})
+                if "keti.re.kr/npu-pe" in al:
+                    v = int(al["keti.re.kr/npu-pe"])
+        except Exception:
+            v = None
+    _NPU_CACHE["t"], _NPU_CACHE["v"] = now, v
+    return v
 
 
 def _remote_pools():
@@ -444,6 +482,26 @@ def _metrics_response():
         "슬라이스 시간 몫 — 계약값(등록 시점, Exp_141)", ctr_s)
     fam("kraken_slice_armed", "1=제어 걸림(armed) 0=풀림(released)", armed_s)
     fam("kraken_slice_control_mode", "슬라이스 제어 상태(mode=armed|released)", mode_s)
+
+    # [Exp_151 4-G] ④ 유지율 — loop_api RETENTION 저장소(④가 보고한 것만).
+    #   신호 없는 슬라이스는 계열 자체를 내지 않는다(0 채움 금지 — Exp_140 규칙).
+    #   stale(>10s)은 버린다: 죽은 ④의 마지막 값이 신선한 척 나가면 안 된다.
+    ret_s = []
+    try:
+        import loop_api as _la
+        for t, v in list(getattr(_la, "RETENTION", {}).items()):
+            if v.get("retention") is None or time.time() - v.get("ts", 0) > 10:
+                continue
+            cls, pod = _slice_extra(t)
+            RSL = L + ',tenant="%s"' % _prom_escape(t)
+            if pod:
+                RSL += ',pod="%s"' % _prom_escape(pod)
+            ret_s.append("kraken_slice_retention_ratio{%s} %s"
+                         % (RSL, v["retention"]))
+    except Exception:
+        pass
+    fam("kraken_slice_retention_ratio",
+        "victim 유지율(base_p95/현재_p95, ④ closed_loop 보고 — 신호 있는 것만)", ret_s)
 
     pools = _remote_pools()
     leased_s, phase_s = [], []

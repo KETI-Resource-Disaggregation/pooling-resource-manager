@@ -60,6 +60,7 @@ _swap_procs = {}       # standby name -> Popen
 
 
 _relocation_events = []   # [Exp_108 D-3] 재배치 추천 보관
+RETENTION = {}            # [Exp_151 4-G] tenant → ④ 유지율 보고(신호 있는 것만)
 
 
 def init():
@@ -110,6 +111,8 @@ def handle_get(h, path):
     if path == "/feeder/status":
         h._send_json(_feeder.status())
 
+    elif path == "/feeder/retention":       # [Exp_151 4-G] 유지율 조회(/metrics 소스)
+        h._send_json({"retention": RETENTION})
     elif path == "/events/relocation":      # [Exp_108 D-3] 발행된 추천 조회
         h._send_json({"events": _relocation_events[-20:], "count": len(_relocation_events)})
     elif path == "/feeder/occupancy":
@@ -172,6 +175,22 @@ def handle_post(h, path, body):
             h._send_json({"ok": True,
                           "restored": _feeder.release_ratio_lease(
                               body.get("tenants", True))})
+        elif path == "/feeder/retention":          # [Exp_151 4-G] ④ 유지율 보고
+            # 신호 있는 테넌트만 온다(④가 0 을 채워 보내지 않는다). /metrics 의
+            # kraken_slice_retention_ratio 가 이 저장소를 읽는다. stale(>10s)은
+            # /metrics 쪽에서 버린다 — 죽은 ④의 값이 계속 나가지 않게.
+            t = body.get("tenant")
+            if not t:
+                h._send_json({"ok": False, "error": "tenant 필요"}, 400)
+                return
+            RETENTION[t] = {"retention": body.get("retention"),
+                            "p95_ms": body.get("p95_ms"),
+                            "base_ms": body.get("base_ms"),
+                            "name": body.get("name"), "ts": time.time()}
+            for k in [k for k, v in RETENTION.items()
+                      if time.time() - v.get("ts", 0) > 60]:
+                RETENTION.pop(k, None)
+            h._send_json({"ok": True})
         elif path == "/feeder/mode_event":         # [Exp_138 2-B 5] ③ 전환 이벤트
             # Go 와이어러가 모드를 바꿀 때마다 사유와 함께 부른다. 발행 실패는
             # 제어를 막지 않으나 조용히 넘기지 않는다(T-5) — 사유를 응답에 싣는다.
@@ -179,7 +198,10 @@ def handle_post(h, path, body):
             #   SliceCreated/SliceDestroyed 를 더한다(지시서 3-A). reason 은
             #   화이트리스트로 제한한다(임의 reason 주입 방지).
             from scanner.mode_event import emit as _emit_mode
-            _ALLOWED = ("ControlModeSwitched", "SliceCreated", "SliceDestroyed")
+            # [Exp_151 1부] ④의 이벤트를 이 경로로 모은다(발행 경로 일원화 —
+            #   결함을 두 곳에서 고치지 않는다. Exp_150 422 가 사례).
+            _ALLOWED = ("ControlModeSwitched", "SliceCreated", "SliceDestroyed",
+                        "InterferenceDetected", "SpaceControlApplied")
             _reason = body.get("reason_kind", "ControlModeSwitched")
             if _reason not in _ALLOWED:
                 h._send_json({"ok": False,
@@ -188,7 +210,8 @@ def handle_post(h, path, body):
             _t = body.get("tenant", "")
             _pod = body.get("pod", "")
             _pod_ns = body.get("pod_ns", "")
-            if _reason == "ControlModeSwitched":
+            if _reason in ("ControlModeSwitched", "InterferenceDetected",
+                           "SpaceControlApplied"):
                 _msg = (f"tenant={_t} mode={body.get('mode','')} "
                         f"reason={body.get('reason','')} class={body.get('class','')}")
                 _name = ""            # 전환은 반복 사건 — generateName 유지
