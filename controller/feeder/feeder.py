@@ -154,6 +154,11 @@ def _redist_warn(msg):
 # [Exp_130] 결정 지평 확정 — 경고 헬퍼가 정의된 뒤여야 한다(폴백 시 경고).
 REDIST_CAP_TICKS = _redist_cap_ticks()
 
+# [Exp_158] 시간축 WC 시제 — 기본 꺼짐. 켜지면 feeder 가 틱마다 armed 테넌트에
+#   "다른 armed 테넌트가 직전 틱에 커널을 냈는가"를 peer_idle 0|1 로 push 한다.
+#   관측 소스 = 재분배 hungry 판정과 같은 time_stats(kernels 누적) — 새 경로 없음.
+TIME_WC_ON = os.environ.get("KRAKEN_TIME_WC", "0") == "1"
+
 
 def _send(sock_path, msg):
     """libbless control socket (SOCK_DGRAM 1-way, Exp_16 send() 동일)."""
@@ -601,7 +606,34 @@ class TimeCreditFeeder:
                 self._redist_probe(list(bud))
             if CTLCHECK_ON and bud:
                 self._ctlcheck(list(bud))
+            if TIME_WC_ON and len(bud) >= 2:
+                self._wc_push(list(bud))
             self._sleep(TICK_S)
+
+    # ---- [Exp_158] WC peer 유휴 신호 ----
+    def _wc_push(self, names):
+        """armed 테넌트별로 '다른 테넌트 유휴 여부'를 push.
+        kernels 누적의 틱 간 delta==0 → 그 테넌트는 이번 틱 유휴로 본다.
+        읽기 실패는 '활동 중'으로 취급(편승을 열지 않는 안전 방향 — T-5:
+        신호를 조용히 유휴로 바꾸면 계약 밖 통과가 근거 없이 늘어난다)."""
+        if not hasattr(self, "_wc_kern"):
+            self._wc_kern = {}
+        delta = {}
+        with self._lock:
+            infos = {n: dict(self._tenants.get(n, {})) for n in names}
+        for n in names:
+            st = read_time_stats(infos[n].get("log", ""))
+            if st is None:
+                delta[n] = 1          # 못 읽음 = 활동 중 취급(안전 방향)
+                continue
+            k = st[1]
+            delta[n] = k - self._wc_kern.get(n, k)
+            self._wc_kern[n] = k
+        for n in names:
+            others_active = any(delta[m] > 0 for m in names if m != n)
+            sock = infos[n].get("sock")
+            if sock:
+                self._send(sock, f"peer_idle {0 if others_active else 1}")
 
     # ---- [Exp_135 5부] 제어 적용 여부 판정 ----
     def _ctlcheck(self, names):
